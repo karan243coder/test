@@ -1,6 +1,7 @@
 """
 media_utils.py - Level 1 & Level 2 Media & Stream Handling Utilities (512MB RAM Koyeb Optimized)
 Handles:
+  - Automatic URL punctuation & ellipsis cleanup (strips trailing '...' from copied links)
   - PRO Direct Stream Finder (extracts master/auto .m3u8 directly from simple webpage URLs)
   - Smart Automatic Job Name Generation from URLs
   - Command Parsing (/record <url>, timed flags, quality selection, custom headers)
@@ -32,12 +33,21 @@ os.makedirs(RECORDINGS_DIR, exist_ok=True)
 os.makedirs(SPLITS_DIR, exist_ok=True)
 
 
+def clean_url_punctuation(url: str) -> str:
+    """Strip trailing ellipsis ('...') or punctuation accidentally included in copied URLs."""
+    url_clean = url.strip()
+    while url_clean.endswith(".") or url_clean.endswith(",") or url_clean.endswith(";") or url_clean.endswith(")") or url_clean.endswith("]"):
+        url_clean = url_clean[:-1]
+    return url_clean
+
+
 def normalize_stream_url(url: str) -> str:
     """
-    Normalize known mirror domains to their canonical domains so yt-dlp extractors recognize them.
-    Example: stripchatgirls.com/username -> stripchat.com/username
+    Normalize known mirror domains to their canonical domains so yt-dlp extractors recognize them,
+    and strip trailing ellipsis punctuation.
+    Example: stripchatgirls.com/username... -> stripchat.com/username
     """
-    url_clean = url.strip()
+    url_clean = clean_url_punctuation(url)
     url_clean = re.sub(
         r"https?://(?:www\.)?(?:stripchatgirls|stripchatglobal|stripchateu|stripchateurope)\.com/",
         "https://stripchat.com/",
@@ -60,7 +70,6 @@ def auto_generate_job_name(url: str) -> str:
             if candidate.lower() in ["m3u8", "master", "playlist", "index", "live", "stream", "chunk", "hls"]:
                 if len(parts) >= 2:
                     candidate = f"{parts[-2]}_{candidate}"
-            # Clean non-alphanumeric chars
             clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", candidate).strip("_")
             if clean_name and len(clean_name) >= 2:
                 return clean_name[:30]
@@ -163,11 +172,9 @@ def _extract_direct_hls_from_webpage_sync(url: str, headers: Dict[str, str]) -> 
         with urllib.request.urlopen(req, timeout=8) as resp:
             html_content = resp.read().decode("utf-8", errors="ignore")
 
-        # Extract title from <title>...</title>
         title_match = re.search(r"<title>(.*?)</title>", html_content, flags=re.IGNORECASE | re.DOTALL)
         title = title_match.group(1).strip() if title_match else ""
 
-        # Find all .m3u8 links in HTML or embedded JSON
         matches = re.findall(
             r"https?://[^\s\"\'<>]+?\.m3u8(?:[^\s\"\'<>]*)?",
             html_content,
