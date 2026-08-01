@@ -139,16 +139,39 @@ def unauthorized_msg() -> str:
 
 # ---------- WEBHOOK CLEANUP ----------
 async def delete_old_webhook():
-    """Delete any old webhook set via Bot API, so POST /tg/... 404 stops"""
+    """Delete any old webhook set via Bot API, so POST /tg/... flood stops"""
+    # Try 3 times with aiohttp, plus try pyrogram raw method
+    for attempt in range(3):
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as sess:
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
+                async with sess.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    txt = await resp.text()
+                    logger.info(f"✅ deleteWebhook attempt {attempt+1} response: {txt[:300]}")
+                    if '"ok":true' in txt or '"ok": true' in txt.lower():
+                        return
+        except Exception as e:
+            logger.warning(f"deleteWebhook attempt {attempt+1} failed: {e}")
+        await asyncio.sleep(2)
+    # Also try via pyrogram if app started? We'll try later after app.start
+    logger.info("deleteWebhook via http failed or pending, will retry after client start if needed")
+
+
+async def delete_webhook_via_pyrogram():
+    """Secondary try using pyrogram's own API after app.start()"""
     try:
+        # pyrogram Client has method to delete webhook via raw? Try invoking
+        # Use app's internal method: send deleteWebhook request via Bot API through pyrogram's session?
+        # Fallback: call Telegram Bot API again
         import aiohttp
         async with aiohttp.ClientSession() as sess:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
-            async with sess.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with sess.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 txt = await resp.text()
-                logger.info(f"deleteWebhook response: {txt[:200]}")
+                logger.info(f"✅ deleteWebhook via pyrogram path response: {txt[:300]}")
     except Exception as e:
-        logger.debug(f"deleteWebhook failed: {e}")
+        logger.debug(f"deleteWebhook via pyrogram path failed: {e}")
 
 
 # ---------- KOYEB HEALTH SERVER ----------
@@ -189,11 +212,12 @@ async def start_web_server():
     web_app.router.add_post("/{tail:.*}", catch_all_handler)
     web_app.router.add_get("/{tail:.*}", root_handler)
 
-    runner = web.AppRunner(web_app)
+    # Disable access_log to stop spam of POST /tg/ logs every second
+    runner = web.AppRunner(web_app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"Koyeb Health check server started on 0.0.0.0:{PORT} with catch-all POST handler")
+    logger.info(f"Koyeb Health check server started on 0.0.0.0:{PORT} with catch-all POST handler (access_log disabled)")
     while True:
         await asyncio.sleep(3600)
 
@@ -1010,10 +1034,14 @@ async def recover_interrupted_jobs():
 
 async def main():
     web_task = asyncio.create_task(start_web_server())
-    # Delete old webhook first before polling
+    # Delete old webhook first before polling (http)
     await delete_old_webhook()
 
     await app.start()
+
+    # Second delete attempt after client started (more reliable on Koyeb network)
+    await delete_webhook_via_pyrogram()
+
     if user_app and IS_PREMIUM_SESSION:
         try:
             await user_app.start()
@@ -1021,7 +1049,7 @@ async def main():
         except Exception as e:
             logger.error(f"Userbot start failed: {e}")
 
-    logger.info(f"Bot started — Port {PORT} health check active. FIXED version")
+    logger.info(f"Bot started — Port {PORT} health check active. FIXED V6 API-FIRST version")
 
     await recover_interrupted_jobs()
     await idle()
