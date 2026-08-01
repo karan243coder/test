@@ -2,12 +2,13 @@ version: '3.8'
 services:
   recorder-bot:
     build: .
-    container_name: recorder_v5
+    container_name: recorder_v10_super
     restart: unless-stopped
     ports:
       - "8080:8080"
     volumes:
       - ./recordings:/app/recordings
       - ./splits:/app/splits
+      - ./recorder.db:/app/recorder.db
     env_file:
       - .env

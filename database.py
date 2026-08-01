@@ -1,10 +1,12 @@
 """
-database.py - Level 3 Persistence Layer using SQLite
-Stores:
-  - Sudo users & authorized admins
-  - Active / interrupted jobs for auto-recovery after container restart
-  - Pending job queue when concurrency limit is reached
-  - Bot configurations & upload settings
+database.py - Super Advanced V10 Persistence Layer (SQLite)
+Tables:
+  - sudo_users      : authorized users
+  - settings        : key-value bot config
+  - active_jobs     : running/recording jobs (crash recovery)
+  - job_queue       : pending jobs when concurrency limit reached
+  - watchlist       : 24/7 auto-record models
+  - bot_stats       : recording counters
 """
 
 import sqlite3
@@ -12,7 +14,7 @@ import json
 import time
 import os
 import logging
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +28,9 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_db():
-    """Initialize all SQLite tables if they do not exist."""
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Table for sudo / authorized users
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sudo_users (
             user_id INTEGER PRIMARY KEY,
@@ -39,7 +39,6 @@ def init_db():
         )
     """)
 
-    # Table for bot settings (key-value store)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -47,7 +46,6 @@ def init_db():
         )
     """)
 
-    # Table for active recording jobs (for persistence/recovery)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS active_jobs (
             job_name TEXT PRIMARY KEY,
@@ -63,7 +61,6 @@ def init_db():
         )
     """)
 
-    # Table for pending job queue
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS job_queue (
             job_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,6 +74,29 @@ def init_db():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            url TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            added_by INTEGER,
+            added_at REAL,
+            last_status TEXT DEFAULT 'unknown',
+            last_checked REAL DEFAULT 0,
+            last_recorded_at REAL DEFAULT 0,
+            enabled INTEGER DEFAULT 1,
+            UNIQUE(username, chat_id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_stats (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
     logger.info(f"Database initialized at {DB_PATH}")
@@ -87,53 +107,43 @@ def init_db():
 def add_sudo(user_id: int, added_by: int = 0) -> bool:
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
+        conn.execute(
             "INSERT OR REPLACE INTO sudo_users (user_id, added_by, added_at) VALUES (?, ?, ?)",
-            (int(user_id), int(added_by), time.time())
-        )
+            (int(user_id), int(added_by), time.time()))
         conn.commit()
         conn.close()
         return True
     except Exception as e:
-        logger.error(f"Error adding sudo user {user_id}: {e}")
+        logger.error(f"add_sudo error: {e}")
         return False
 
 
 def remove_sudo(user_id: int) -> bool:
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM sudo_users WHERE user_id = ?", (int(user_id),))
-        rows = cursor.rowcount
+        cur = conn.execute("DELETE FROM sudo_users WHERE user_id = ?", (int(user_id),))
         conn.commit()
+        rows = cur.rowcount
         conn.close()
         return rows > 0
     except Exception as e:
-        logger.error(f"Error removing sudo user {user_id}: {e}")
+        logger.error(f"remove_sudo error: {e}")
         return False
 
 
 def get_sudo_users() -> Set[int]:
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM sudo_users")
-        rows = cursor.fetchall()
+        rows = conn.execute("SELECT user_id FROM sudo_users").fetchall()
         conn.close()
-        return {int(row["user_id"]) for row in rows}
+        return {int(r["user_id"]) for r in rows}
     except Exception as e:
-        logger.error(f"Error fetching sudo users: {e}")
+        logger.error(f"get_sudo_users error: {e}")
         return set()
 
 
 def is_sudo(user_id: int, owner_id: int = 0, env_sudo_list: Optional[List[int]] = None) -> bool:
-    """
-    Check if a user is authorized.
-    Returns True if user_id matches OWNER_ID, is in env SUDO_USERS, is in DB sudo_users, or if owner_id == 0.
-    """
     if owner_id == 0:
-        # If no owner is configured in .env, default open or log warning
         return True
     if int(user_id) == int(owner_id):
         return True
@@ -142,45 +152,39 @@ def is_sudo(user_id: int, owner_id: int = 0, env_sudo_list: Optional[List[int]] 
     return int(user_id) in get_sudo_users()
 
 
-# ---------- SETTINGS MANAGEMENT ----------
+# ---------- SETTINGS ----------
 
 def set_setting(key: str, value: Any) -> bool:
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-            (str(key), str(value))
-        )
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                     (str(key), str(value)))
         conn.commit()
         conn.close()
         return True
     except Exception as e:
-        logger.error(f"Error setting {key}: {e}")
+        logger.error(f"set_setting {key} error: {e}")
         return False
 
 
 def get_setting(key: str, default: Any = None) -> Any:
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM settings WHERE key = ?", (str(key),))
-        row = cursor.fetchone()
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (str(key),)).fetchone()
         conn.close()
         return row["value"] if row else default
     except Exception as e:
-        logger.error(f"Error getting setting {key}: {e}")
+        logger.error(f"get_setting {key} error: {e}")
         return default
 
 
-# ---------- ACTIVE JOBS PERSISTENCE ----------
+# ---------- ACTIVE JOBS (crash recovery) ----------
 
 def save_job(job_data: Dict[str, Any]) -> bool:
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT OR REPLACE INTO active_jobs 
+        conn.execute("""
+            INSERT OR REPLACE INTO active_jobs
             (job_name, url, file_path, chat_id, status_msg_id, start_time, duration_limit, headers_json, quality, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
@@ -199,33 +203,30 @@ def save_job(job_data: Dict[str, Any]) -> bool:
         conn.close()
         return True
     except Exception as e:
-        logger.error(f"Error saving job {job_data.get('job_name')}: {e}")
+        logger.error(f"save_job error: {e}")
         return False
 
 
 def remove_job(job_name: str) -> bool:
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM active_jobs WHERE job_name = ?", (str(job_name),))
+        conn.execute("DELETE FROM active_jobs WHERE job_name = ?", (str(job_name),))
         conn.commit()
         conn.close()
         return True
     except Exception as e:
-        logger.error(f"Error removing job {job_name}: {e}")
+        logger.error(f"remove_job error: {e}")
         return False
 
 
 def get_all_active_jobs() -> List[Dict[str, Any]]:
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM active_jobs")
-        rows = cursor.fetchall()
+        rows = conn.execute("SELECT * FROM active_jobs").fetchall()
         conn.close()
-        results = []
+        out = []
         for row in rows:
-            results.append({
+            out.append({
                 "job_name": row["job_name"],
                 "url": row["url"],
                 "file_path": row["file_path"],
@@ -237,33 +238,30 @@ def get_all_active_jobs() -> List[Dict[str, Any]]:
                 "quality": row["quality"],
                 "status": row["status"]
             })
-        return results
+        return out
     except Exception as e:
-        logger.error(f"Error fetching active jobs: {e}")
+        logger.error(f"get_all_active_jobs error: {e}")
         return []
 
 
 def update_job_status(job_name: str, status: str) -> bool:
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("UPDATE active_jobs SET status = ? WHERE job_name = ?", (str(status), str(job_name)))
+        conn.execute("UPDATE active_jobs SET status = ? WHERE job_name = ?", (str(status), str(job_name)))
         conn.commit()
         conn.close()
         return True
     except Exception as e:
-        logger.error(f"Error updating job status for {job_name}: {e}")
+        logger.error(f"update_job_status error: {e}")
         return False
 
 
-# ---------- JOB QUEUE (CONCURRENCY CONTROL) ----------
+# ---------- JOB QUEUE ----------
 
 def add_queue_job(job_data: Dict[str, Any]) -> Optional[int]:
-    """Add a job to pending queue. Returns 1-based queue position."""
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
+        conn.execute("""
             INSERT INTO job_queue (job_name, url, chat_id, duration_limit, headers_json, quality, added_time)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
@@ -276,30 +274,24 @@ def add_queue_job(job_data: Dict[str, Any]) -> Optional[int]:
             time.time()
         ))
         conn.commit()
-        cursor.execute("SELECT COUNT(*) as count FROM job_queue")
-        pos = cursor.fetchone()["count"]
+        count = conn.execute("SELECT COUNT(*) as c FROM job_queue").fetchone()["c"]
         conn.close()
-        return pos
+        return count
     except sqlite3.IntegrityError:
-        logger.warning(f"Job name {job_data.get('job_name')} already in queue.")
         return None
     except Exception as e:
-        logger.error(f"Error adding queue job: {e}")
+        logger.error(f"add_queue_job error: {e}")
         return None
 
 
 def pop_queue_job() -> Optional[Dict[str, Any]]:
-    """Pop the oldest job from queue to start recording."""
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM job_queue ORDER BY job_id ASC LIMIT 1")
-        row = cursor.fetchone()
+        row = conn.execute("SELECT * FROM job_queue ORDER BY job_id ASC LIMIT 1").fetchone()
         if not row:
             conn.close()
             return None
-        job_id = row["job_id"]
-        cursor.execute("DELETE FROM job_queue WHERE job_id = ?", (job_id,))
+        conn.execute("DELETE FROM job_queue WHERE job_id = ?", (row["job_id"],))
         conn.commit()
         conn.close()
         return {
@@ -311,44 +303,160 @@ def pop_queue_job() -> Optional[Dict[str, Any]]:
             "quality": row["quality"]
         }
     except Exception as e:
-        logger.error(f"Error popping queue job: {e}")
+        logger.error(f"pop_queue_job error: {e}")
         return None
 
 
 def get_queue_jobs() -> List[Dict[str, Any]]:
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM job_queue ORDER BY job_id ASC")
-        rows = cursor.fetchall()
+        rows = conn.execute("SELECT * FROM job_queue ORDER BY job_id ASC").fetchall()
         conn.close()
-        results = []
-        for row in rows:
-            results.append({
-                "job_id": row["job_id"],
-                "job_name": row["job_name"],
-                "url": row["url"],
-                "chat_id": row["chat_id"],
-                "duration_limit": row["duration_limit"],
-                "headers": json.loads(row["headers_json"] or "{}"),
-                "quality": row["quality"],
-                "added_time": row["added_time"]
-            })
-        return results
+        return [dict(r) for r in rows]
     except Exception as e:
-        logger.error(f"Error fetching queue jobs: {e}")
+        logger.error(f"get_queue_jobs error: {e}")
         return []
 
 
 def remove_queue_job(job_name: str) -> bool:
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM job_queue WHERE job_name = ?", (str(job_name),))
-        rows = cursor.rowcount
+        cur = conn.execute("DELETE FROM job_queue WHERE job_name = ?", (str(job_name),))
         conn.commit()
+        rows = cur.rowcount
         conn.close()
         return rows > 0
     except Exception as e:
-        logger.error(f"Error removing queue job {job_name}: {e}")
+        logger.error(f"remove_queue_job error: {e}")
         return False
+
+
+# ---------- WATCHLIST (24/7 auto-record) ----------
+
+def add_watch(url: str, username: str, chat_id: int, added_by: int = 0) -> Tuple[bool, str]:
+    """Returns (ok, msg)."""
+    try:
+        conn = get_connection()
+        exists = conn.execute(
+            "SELECT id FROM watchlist WHERE username = ? AND chat_id = ?",
+            (username, int(chat_id))).fetchone()
+        if exists:
+            conn.close()
+            return False, f"`{username}` pehle se watchlist mein hai."
+        conn.execute("""
+            INSERT INTO watchlist (username, url, chat_id, added_by, added_at, last_status, last_checked)
+            VALUES (?, ?, ?, ?, ?, 'unknown', 0)
+        """, (username, url, int(chat_id), int(added_by), time.time()))
+        conn.commit()
+        conn.close()
+        return True, f"`{username}` watchlist mein add ho gaya ✅"
+    except Exception as e:
+        logger.error(f"add_watch error: {e}")
+        return False, f"Add watch fail: {e}"
+
+
+def remove_watch(username: str, chat_id: int) -> bool:
+    try:
+        conn = get_connection()
+        cur = conn.execute("DELETE FROM watchlist WHERE username = ? AND chat_id = ?",
+                           (username, int(chat_id)))
+        conn.commit()
+        rows = cur.rowcount
+        conn.close()
+        return rows > 0
+    except Exception as e:
+        logger.error(f"remove_watch error: {e}")
+        return False
+
+
+def get_watchlist() -> List[Dict[str, Any]]:
+    try:
+        conn = get_connection()
+        rows = conn.execute("SELECT * FROM watchlist ORDER BY added_at ASC").fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"get_watchlist error: {e}")
+        return []
+
+
+def get_watches_for_chat(chat_id: int) -> List[Dict[str, Any]]:
+    try:
+        conn = get_connection()
+        rows = conn.execute("SELECT * FROM watchlist WHERE chat_id = ? ORDER BY added_at ASC",
+                            (int(chat_id),)).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"get_watches_for_chat error: {e}")
+        return []
+
+
+def update_watch_status(username: str, chat_id: int, status: str, last_recorded_at: float = None):
+    try:
+        conn = get_connection()
+        if last_recorded_at is not None:
+            conn.execute("""
+                UPDATE watchlist SET last_status = ?, last_checked = ?, last_recorded_at = ?
+                WHERE username = ? AND chat_id = ?
+            """, (status, time.time(), last_recorded_at, username, int(chat_id)))
+        else:
+            conn.execute("""
+                UPDATE watchlist SET last_status = ?, last_checked = ?
+                WHERE username = ? AND chat_id = ?
+            """, (status, time.time(), username, int(chat_id)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"update_watch_status error: {e}")
+
+
+def set_watch_enabled(username: str, chat_id: int, enabled: bool) -> bool:
+    try:
+        conn = get_connection()
+        cur = conn.execute("UPDATE watchlist SET enabled = ? WHERE username = ? AND chat_id = ?",
+                           (1 if enabled else 0, username, int(chat_id)))
+        conn.commit()
+        rows = cur.rowcount
+        conn.close()
+        return rows > 0
+    except Exception as e:
+        logger.error(f"set_watch_enabled error: {e}")
+        return False
+
+
+# ---------- BOT STATS ----------
+
+def bump_stat(key: str, amount: float = 1):
+    try:
+        conn = get_connection()
+        row = conn.execute("SELECT value FROM bot_stats WHERE key = ?", (key,)).fetchone()
+        cur = float(row["value"]) if row else 0.0
+        conn.execute("INSERT OR REPLACE INTO bot_stats (key, value) VALUES (?, ?)",
+                     (key, str(cur + amount)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"bump_stat error: {e}")
+
+
+def get_stat(key: str, default: float = 0.0) -> float:
+    try:
+        conn = get_connection()
+        row = conn.execute("SELECT value FROM bot_stats WHERE key = ?", (key,)).fetchone()
+        conn.close()
+        return float(row["value"]) if row else default
+    except Exception as e:
+        logger.error(f"get_stat error: {e}")
+        return default
+
+
+def get_all_stats() -> Dict[str, float]:
+    try:
+        conn = get_connection()
+        rows = conn.execute("SELECT * FROM bot_stats").fetchall()
+        conn.close()
+        return {r["key"]: float(r["value"]) for r in rows}
+    except Exception as e:
+        logger.error(f"get_all_stats error: {e}")
+        return {}

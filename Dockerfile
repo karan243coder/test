@@ -16,7 +16,6 @@ RUN mkdir -p recordings splits
 
 EXPOSE 8080
 
-# Koyeb expects PORT 8080
 ENV PORT=8080
 
 CMD ["python", "-u", "main.py"]

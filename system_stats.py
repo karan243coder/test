@@ -4,7 +4,7 @@ Provides rich server health diagnostics: CPU, Memory, Disk Space, System & Bot U
 Safe import fallback if psutil is not present in local test environments.
 """
 
-import os
+
 import time
 import platform
 import logging
