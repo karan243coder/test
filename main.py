@@ -6,7 +6,7 @@ V4 FINAL - Koyeb + Github Ready
 - FloodWait protection (bot hang nahi hoga)
 - Docker + Koyeb ready
 
-ONLY FOR YOUR OWN CONTENT OR WITH WRITTEN CONSENT
+
 """
 
 import os
@@ -309,7 +309,7 @@ async def record_cmd(client, message: Message):
     if not is_direct_media_link(hls_url):
         await safe_send_text(message.chat.id,
             "⚠️ Ye direct HLS link nahi hai (jaise webpage). Direct .m3u8 link de.\n"
-            "Dost ke liye - uske broadcaster dashboard wala HLS lo with consent."
+            "uske broadcaster dashboard wala HLS lo with consent."
         )
         return
 
