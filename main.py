@@ -87,6 +87,7 @@ auto_restart_count: Dict[str, int] = {}   # job_name -> restarts used
 
 _BOOT_TIME = time.time()
 _last_update_time = time.time()   # watchdog ke liye
+VERSION = "V11.2-DIAG"           # health endpoint mein dikhega - deploy verify karne ke liye
 
 app = Client("recorder_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir=".")
 user_app = None
@@ -614,7 +615,10 @@ async def root_handler(request):
 
 
 async def health_handler(request):
-    return web.Response(text=f"OK - {len(active_jobs)} active | {len(database.get_queue_jobs())} queued", status=200)
+    uptime = system_stats.format_duration_human(time.time() - _BOOT_TIME)
+    return web.Response(text=f"OK - {VERSION} | {len(active_jobs)} active | "
+                             f"{len(database.get_queue_jobs())} queued | uptime {uptime} | "
+                             f"last_update {time.time()-_last_update_time:.0f}s ago", status=200)
 
 
 async def _real_mouflon_proxy(request):
