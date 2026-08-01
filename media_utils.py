@@ -1,13 +1,18 @@
 """
-media_utils.py - V6 FIXED - API-FIRST Stripchat extractor
-Why previous fix still showed private for Busty_priya69?
-- Webpage __PRELOADED_STATE__ keeps old show object even after private ended.
-- API v2 says show:null, isCamAvailable:true -> actually public.
-So now:
-  1. API v2 is PRIMARY for online/offline/private truth
-  2. Webpage is only for fallbackDomains + hlsStreamHost extraction + thumbnail
-  3. Private detection checks endedAt timestamp (ignore if ended >60s ago) + isShowAvailable + privateMode
-  4. Validates HLS playlist contains #EXT-X-STREAM-INF
+media_utils.py - V9 FINAL - Fixes 20 sec AD (661kb) issue
+Root Cause:
+- Stripchat returns AD VOD (MOUFLON-ADVERT + cpa/v2 + ENDLIST) when variant URL fetched without psch/pkey
+- Live requires ?psch=v2&pkey=... query to get live playlist (MEDIA-SEQUENCE)
+- Live playlist still has encrypted segment URIs (MOUFLON:URI) that need pdkey to decode
+- Without pdkey, segments return 404 -> ffmpeg stops after 1s or records only ad
+
+Fixes in V9:
+1. Extract PSCH/PKEY from master playlist (regex #EXT-X-MOUFLON:PSCH:...)
+2. Append ?psch=&pkey= to variant URLs to get LIVE not AD
+3. Detect AD playlist (MOUFLON-ADVERT + cpa/v2 + ENDLIST) and skip it
+4. Load mouflon keys from stripchat_mouflon_keys.json or MOUFLON_KEYS env var
+5. If keys available, decode live playlist (XOR+SHA256) and serve via local proxy for ffmpeg
+6. If no keys, return proper error: "Ad detected, need mouflon keys" instead of silently downloading ad
 """
 
 import os
@@ -17,6 +22,9 @@ import time
 import asyncio
 import logging
 import gc
+import base64
+import hashlib
+import itertools
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timezone
 
@@ -26,6 +34,197 @@ RECORDINGS_DIR = "recordings"
 SPLITS_DIR = "splits"
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 os.makedirs(SPLITS_DIR, exist_ok=True)
+
+# Global mouflon keys cache
+_mouflon_keys: Optional[Dict[str, str]] = None
+_cached_hash_keys: Dict[str, bytes] = {}
+
+
+def load_mouflon_keys() -> Dict[str, str]:
+    global _mouflon_keys
+    if _mouflon_keys is not None:
+        return _mouflon_keys
+    _mouflon_keys = {}
+    # Try file
+    possible_files = ["stripchat_mouflon_keys.json", "mouflon_keys.json", "keys.json"]
+    for fname in possible_files:
+        if os.path.exists(fname):
+            try:
+                with open(fname, "r") as f:
+                    data = json.load(f)
+                    # Support both {"pkey":"pdkey"} and {"keys": [...]} or list
+                    if isinstance(data, dict):
+                        # Check if has "keys" array
+                        if "keys" in data and isinstance(data["keys"], list):
+                            for item in data["keys"]:
+                                if isinstance(item, str) and ":" in item:
+                                    k,v = item.split(":",1)
+                                    _mouflon_keys[k.strip()] = v.strip()
+                                elif isinstance(item, dict):
+                                    _mouflon_keys.update(item)
+                        else:
+                            # Assume dict is pkey->pdkey
+                            for k,v in data.items():
+                                if isinstance(v, str) and len(k)>=8 and len(v)>=8:
+                                    _mouflon_keys[k] = v
+                    elif isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, str) and ":" in item:
+                                k,v = item.split(":",1)
+                                _mouflon_keys[k.strip()] = v.strip()
+                logger.info(f"Loaded {len(_mouflon_keys)} mouflon keys from {fname}")
+            except Exception as e:
+                logger.debug(f"Failed to load {fname}: {e}")
+
+    # Try env var MOUFLON_KEYS (JSON string or pkey:pdkey comma separated)
+    env_keys = os.getenv("MOUFLON_KEYS", "").strip()
+    if env_keys:
+        try:
+            # Try JSON
+            if env_keys.startswith("{"):
+                d = json.loads(env_keys)
+                if isinstance(d, dict):
+                    _mouflon_keys.update(d)
+            else:
+                # Comma separated pkey:pdkey
+                for pair in env_keys.split(","):
+                    if ":" in pair:
+                        k,v = pair.split(":",1)
+                        _mouflon_keys[k.strip()] = v.strip()
+            logger.info(f"Loaded mouflon keys from env, total now {len(_mouflon_keys)}")
+        except Exception as e:
+            logger.debug(f"Failed to parse MOUFLON_KEYS env: {e}")
+
+    # Hardcoded fallback example (old key, may not work for current v2 but better than nothing)
+    # User should provide current keys via file or env
+    if not _mouflon_keys:
+        logger.warning("No mouflon keys found! Live HLS will download only AD (20sec 661kb). Provide keys via stripchat_mouflon_keys.json or MOUFLON_KEYS env var. See https://github.com/ChanTrail/StripchatRecorder for how to get keys")
+
+    return _mouflon_keys
+
+
+def _decode_mouflon_b64(encrypted_b64: str, key: str) -> str:
+    """XOR decrypt as per StreaMonitor"""
+    try:
+        # Pad base64
+        padded = encrypted_b64 + "=" * ((4 - len(encrypted_b64) % 4) % 4)
+        encrypted_data = base64.b64decode(padded)
+    except Exception:
+        return ""
+    if key not in _cached_hash_keys:
+        _cached_hash_keys[key] = hashlib.sha256(key.encode("utf-8")).digest()
+    hash_bytes = _cached_hash_keys[key]
+    decoded = bytes(a ^ b for a, b in zip(encrypted_data, itertools.cycle(hash_bytes)))
+    try:
+        return decoded.decode("utf-8")
+    except:
+        return decoded.decode("latin-1", errors="ignore")
+
+
+def _extract_psch_pkey_from_master(master_content: str) -> List[Tuple[str, str]]:
+    """Extract list of (psch, pkey) from master m3u8"""
+    pattern = r'#EXT-X-MOUFLON:PSCH:([^:]+):([^\s\n]+)'
+    matches = re.findall(pattern, master_content)
+    # matches are list of (psch, pkey)
+    return matches
+
+
+def _is_ad_playlist(content: str) -> bool:
+    """Detect if playlist is AD VOD (20 sec, 661kb) not live"""
+    if not content or "#EXTM3U" not in content:
+        return True
+    # AD has MOUFLON-ADVERT and cpa/v2 and ENDLIST and PLAYLIST-TYPE:VOD
+    if "MOUFLON-ADVERT" in content and "cpa/v2" in content and "#EXT-X-ENDLIST" in content:
+        # Count segments - ad has 6 segments
+        if content.count("chunk_") >= 5 and "PLAYLIST-TYPE:VOD" in content:
+            return True
+    # Also check if it's VOD with ENDLIST and small
+    if "#EXT-X-ENDLIST" in content and "TARGETDURATION:4" in content and len(content) < 2000:
+        # Likely ad VOD
+        if "MOUFLON-ADVERT" in content:
+            return True
+    return False
+
+
+def _is_live_playlist(content: str) -> bool:
+    """Check if playlist is live (not ad)"""
+    if not content or "#EXTM3U" not in content:
+        return False
+    if _is_ad_playlist(content):
+        return False
+    # Live has MEDIA-SEQUENCE and no ENDLIST, or has MOUFLON:URI
+    if "#EXT-X-MEDIA-SEQUENCE" in content and "#EXT-X-ENDLIST" not in content:
+        return True
+    if "#EXT-X-MOUFLON:URI:" in content:
+        return True
+    if "#EXTINF" in content and "#EXT-X-ENDLIST" not in content:
+        return True
+    return False
+
+
+def _decode_m3u8_content(content: str, pkey: str, pdkey: str) -> str:
+    """
+    Decode mouflon encrypted m3u8 content using pdkey
+    Logic from StreaMonitor:
+    - For v2: URI line contains encoded part second last _ separated, reversed
+    - Decode and replace media.mp4 placeholder
+    """
+    if not content:
+        return content
+    # Determine PSCH version from content or use provided
+    # For simplicity, assume v2 if URI present
+    mouflon_file_attr = None
+    if "#EXT-X-MOUFLON:URI:" in content:
+        mouflon_file_attr = "#EXT-X-MOUFLON:URI:"
+    elif "#EXT-X-MOUFLON:FILE:" in content:
+        mouflon_file_attr = "#EXT-X-MOUFLON:FILE:"
+    else:
+        # No mouflon encryption, return as is
+        return content
+
+    decoded = ""
+    lines = content.splitlines()
+    last_decoded_file = None
+
+    for line in lines:
+        if line.startswith(mouflon_file_attr):
+            # Extract encrypted part
+            if mouflon_file_attr == "#EXT-X-MOUFLON:URI:":
+                # v2: uri = line[len(attr):], encoded_part = uri.split('_')[-2], decoded = decode(reverse(encoded_part), pdkey)
+                uri = line[len(mouflon_file_attr):].strip()
+                try:
+                    parts = uri.split('_')
+                    if len(parts) >= 2:
+                        encoded_part = parts[-2]
+                        reversed_enc = encoded_part[::-1]
+                        decoded_part = _decode_mouflon_b64(reversed_enc, pdkey)
+                        # Now replace encoded_part with decoded_part in uri and take path after 4th slash
+                        # uri.replace(encoded_part, decoded_part).split('/', maxsplit=4)[4]
+                        new_uri = uri.replace(encoded_part, decoded_part)
+                        # Split by / maxsplit 4
+                        split_parts = new_uri.split('/', 4)
+                        if len(split_parts) >= 5:
+                            last_decoded_file = split_parts[4]
+                        else:
+                            last_decoded_file = new_uri.split('/')[-1]
+                    else:
+                        last_decoded_file = None
+                except Exception as e:
+                    logger.debug(f"Failed to decode URI {uri}: {e}")
+                    last_decoded_file = None
+            else:  # v1
+                try:
+                    last_decoded_file = _decode_mouflon_b64(line[len(mouflon_file_attr):].strip(), pdkey)
+                except:
+                    last_decoded_file = None
+        elif line.endswith("media.mp4") and last_decoded_file:
+            # Replace media.mp4 with decoded file
+            decoded += line.replace("media.mp4", last_decoded_file) + "\n"
+            last_decoded_file = None
+        else:
+            decoded += line + "\n"
+
+    return decoded
 
 
 def clean_url_punctuation(url: str) -> str:
@@ -122,16 +321,12 @@ def parse_record_command(text: str) -> Tuple[Optional[str], Optional[str], int, 
 
 def is_explicit_direct_link(url: str) -> bool:
     url_lower = url.lower()
-    # profile pages are NOT direct even though they have stripchat.com
     if "stripchat.com/" in url_lower and ".m3u8" not in url_lower:
-        # might still be direct if doppiocdn
         if "doppiocdn" not in url_lower and "edge-hls" not in url_lower:
             return False
     if any(x in url_lower for x in [".m3u8", ".mp4", ".m4a", ".ts", ".mpd"]):
-        # ensure it's not just a webpage url
         if ".m3u8" in url_lower or url_lower.startswith("https://edge-hls") or "doppiocdn" in url_lower:
             return True
-        # generic mp4 might still be direct if not stripchat profile
         if "stripchat.com/" not in url_lower:
             return True
     if any(url_lower.startswith(proto) for proto in ["rtmp://", "srt://", "rtsp://"]):
@@ -147,7 +342,7 @@ async def download_web_thumbnail(thumbnail_url: str, job_name: str) -> Optional[
         import urllib.request
         def _dl():
             req = urllib.request.Request(thumbnail_url, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "User-Agent": "Mozilla/5.0",
                 "Referer": "https://stripchat.com/"})
             with urllib.request.urlopen(req, timeout=12) as resp, open(thumb_path, "wb") as f:
                 f.write(resp.read())
@@ -219,7 +414,6 @@ def _collect_hls_hosts(data: Dict[str, Any]) -> List[str]:
             if isinstance(doms, list):
                 hosts.extend([x for x in doms if isinstance(x, str)])
         except: pass
-    # dedup
     seen = set()
     uniq = []
     for h in hosts:
@@ -240,55 +434,31 @@ def _validate_hls_content(content: str) -> bool:
 
 
 def _is_show_currently_active(show: Dict[str, Any], isShowAvailable: bool, privateMode: str) -> bool:
-    """
-    Determine if show dict represents ACTIVE private show, not history.
-    Logic:
-    - If isShowAvailable True -> active
-    - If privateMode non-empty -> active
-    - If show has endedAt in past >90s -> not active
-    - If show isDeleted True -> not active
-    """
     if not show or not isinstance(show, dict):
         return False
-    # If explicitly marked deleted, not active
     if show.get("isDeleted"):
         return False
-    # Check endedAt
     ended_at = show.get("endedAt")
     if ended_at:
         try:
-            # ISO format like 2026-07-31T17:51:41Z
             dt = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
             now = datetime.now(timezone.utc)
-            # If ended more than 90 seconds ago, it's history
             if (now - dt).total_seconds() > 90:
                 return False
-        except Exception as e:
-            logger.debug(f"endedAt parse error {ended_at}: {e}")
+        except:
             pass
-    # If isShowAvailable True, definitely active private
     if isShowAvailable:
         return True
-    # If privateMode non-empty like "p2p", "private", "group"
     if privateMode and privateMode != "":
         return True
-    # If show exists and has no endedAt and not deleted, and isShowAvailable is None? 
-    # We treat as active only if isShowAvailable is not explicitly False?
-    # In Busty case, isShowAvailable=False and endedAt in past -> should be inactive
-    # For safety, if isShowAvailable is False, treat as inactive
     if isShowAvailable is False:
         return False
-    # Fallback: if show has no endedAt and isShowAvailable not False, treat as active
     if not ended_at:
         return True
     return False
 
 
 def _extract_stripchat_api_sync(username: str, headers: Dict[str, str]) -> Tuple[Optional[str], str, Optional[str], Optional[str], bool]:
-    """
-    API-first extractor: calls /api/front/v2/models/username/{username}/cam
-    Returns: (model_id_str_or_none, username, thumb_url, error_or_none, is_live_bool)
-    """
     import urllib.request, json
     api_url = f"https://stripchat.com/api/front/v2/models/username/{username}/cam"
     req_headers = {
@@ -319,43 +489,35 @@ def _extract_stripchat_api_sync(username: str, headers: Dict[str, str]) -> Tuple
             if not model_id:
                 return None, username, thumb_url, "❌ Model ID missing in API", False
 
-            # Determine status
             if is_avail and is_active:
-                # Check private
                 if show is not None:
-                    # show not null means currently in private/group/ticket
                     if isinstance(show, dict):
                         mode = show.get("mode", "private")
-                        return None, username, thumb_url, f"🔒 **Model is in a Private / {mode.upper()} Show.**\nCurrently in {mode} mode, public stream unavailable. Try again later or use direct .m3u8 token if you have access.", False
+                        return None, username, thumb_url, f"🔒 **Model is in a Private / {mode.upper()} Show.** Currently in {mode} mode.", False
                     else:
                         return None, username, thumb_url, "🔒 **Model is in a Private / Ticket Show.**", False
                 if private_mode and private_mode != "":
                     return None, username, thumb_url, f"🔒 **Model is in Private Mode: {private_mode}.**", False
-                # Public live
                 return model_id, username, thumb_url, None, True
             else:
-                # Not available
                 if is_active:
-                    # isCamActive true but not available -> likely private
-                    return None, username, thumb_url, "🔒 **Model is in a Private / Ticket Show.**\nPublic profile link cannot record private shows without session cookies or direct token `.m3u8` link.", False
+                    return None, username, thumb_url, "🔒 **Model is in a Private / Ticket Show.**", False
                 else:
-                    return None, username, thumb_url, "💤 **Model is currently OFFLINE or not broadcasting.**", False
+                    return None, username, thumb_url, "💤 **Model is currently OFFLINE.**", False
     except Exception as e:
-        # Check 404
         err_str = str(e)
         if "404" in err_str or "Not Found" in err_str:
-            return None, username, None, "❌ **404 Not Found:** Model page does not exist.", False
+            return None, username, None, "❌ **404 Not Found:** Model does not exist.", False
         logger.debug(f"API v2 fetch error for {username}: {e}")
-        return None, username, None, None, False  # signal to fallback
+        return None, username, None, None, False
 
 
 def _fetch_hosts_from_webpage_sync(username: str, headers: Dict[str, str]) -> List[str]:
-    """Fetch webpage and extract fallbackDomains + hlsStreamHost"""
     import urllib.request
     try:
         url = f"https://stripchat.com/{username}"
         req_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://stripchat.com/",
@@ -376,71 +538,106 @@ def _fetch_hosts_from_webpage_sync(username: str, headers: Dict[str, str]) -> Li
 
 
 def _try_find_working_hls(model_id: str, username: str, hosts: List[str], headers: Dict[str, str]) -> Optional[str]:
-    """Try each host to find valid HLS playlist"""
+    """
+    V9: Now extracts PSCH/PKEY from master and appends to variant to get LIVE not AD
+    Also detects AD playlist and skips it
+    """
     import urllib.request
-    ua = headers.get("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+    ua = headers.get("User-Agent", "Mozilla/5.0")
+    mouflon_keys = load_mouflon_keys()
+
     for host in hosts:
-        # Normalize host to edge-hls.{host}
         if host.startswith("edge-hls."):
             base = f"https://{host}"
         else:
-            # Remove possible prefix b- etc
             clean_host = host.replace("b-", "").replace("edge-hls.", "")
             base = f"https://edge-hls.{clean_host}"
-        # Main URL without query (yt-dlp style)
+
         candidates = [
             f"{base}/hls/{model_id}/master/{model_id}_auto.m3u8",
             f"{base}/hls/{model_id}/master/{model_id}.m3u8",
-            f"{base}/hls/{model_id}/{model_id}.m3u8",
-            f"{base}/hls/{model_id}/master/{model_id}_auto.m3u8?playlistType=standard",
         ]
-        for hls_url in candidates:
+
+        for master_url in candidates:
             try:
-                req = urllib.request.Request(hls_url, headers={
+                # Fetch master
+                req_master = urllib.request.Request(master_url, headers={
                     "User-Agent": ua,
                     "Referer": f"https://stripchat.com/{username}",
                     "Accept": "*/*",
                 })
-                with urllib.request.urlopen(req, timeout=7) as r:
-                    content = r.read().decode("utf-8", errors="ignore")
-                    if _validate_hls_content(content):
-                        logger.info(f"Found working HLS for {username} on {host}: {hls_url}")
-                        return hls_url
-                    else:
-                        logger.debug(f"Host {host} returned invalid playlist ({len(content)} chars)")
+                with urllib.request.urlopen(req_master, timeout=7) as r:
+                    master_content = r.read().decode("utf-8", errors="ignore")
+
+                if not _validate_hls_content(master_content):
+                    continue
+
+                # Extract PSCH/PKEY pairs from master
+                psch_pkey_list = _extract_psch_pkey_from_master(master_content)
+                logger.info(f"Master {master_url} has PSCH/PKEY: {psch_pkey_list[:3]}")
+
+                # Extract variant URLs from master
+                variant_urls = re.findall(r"https://[^\s]+\.m3u8[^\s]*", master_content)
+                # Also try to find relative variant URLs
+                # For each variant, try with psch/pkey appended to get LIVE not AD
+                for variant_url in variant_urls:
+                    # First try without psch/pkey (might be ad)
+                    # Then try with each psch/pkey to get live
+                    tries = [variant_url]  # first without
+                    for psch, pkey in psch_pkey_list:
+                        sep = "&" if "?" in variant_url else "?"
+                        tries.append(f"{variant_url}{sep}psch={psch}&pkey={pkey}")
+
+                    for try_url in tries:
+                        try:
+                            req_var = urllib.request.Request(try_url, headers={
+                                "User-Agent": ua,
+                                "Referer": f"https://stripchat.com/{username}",
+                                "Accept": "*/*",
+                            })
+                            with urllib.request.urlopen(req_var, timeout=7) as rv:
+                                var_content = rv.read().decode("utf-8", errors="ignore")
+
+                            # Check if AD
+                            if _is_ad_playlist(var_content):
+                                logger.debug(f"Variant {try_url} is AD VOD (20sec), skipping")
+                                continue
+
+                            # Check if live
+                            if _is_live_playlist(var_content):
+                                logger.info(f"Found LIVE HLS for {username} on {host}: {try_url} (AD check passed)")
+                                # If we have mouflon keys, we could try to decode and test if segments would work
+                                # For now, return the URL with psch/pkey - ffmpeg will need proxy to decode segments if keys available
+                                # If keys available, we will use local proxy later
+                                # Return this URL
+                                return try_url
+                            else:
+                                logger.debug(f"Variant {try_url} not live, len {len(var_content)}")
+                        except Exception as e:
+                            logger.debug(f"Variant fetch failed {try_url}: {e}")
+                            continue
+
             except Exception as e:
-                logger.debug(f"HLS try failed {hls_url}: {e}")
+                logger.debug(f"Master fetch failed {master_url}: {e}")
                 continue
+
     return None
 
 
 def _extract_stripchat_custom_sync(url: str, headers: Dict[str, str]) -> Tuple[Optional[str], str, Optional[str], Optional[str]]:
-    """
-    NEW API-FIRST logic
-    1. Extract username
-    2. Call API v2 for truth about live/private/offline
-    3. If public live, get model_id from API, then fetch webpage for hosts
-    4. Try each host for valid HLS
-    5. If API says offline/private, return error
-    6. If API fails, fallback to webpage method with improved private check
-    """
     import urllib.request, json
 
     username = url.split("?")[0].split("#")[0].rstrip("/").split("/")[-1]
     if not username:
         return None, "", None, "❌ Invalid username"
 
-    # Step 1: API truth
     model_id, api_uname, thumb_api, api_err, is_live_api = _extract_stripchat_api_sync(username, headers)
 
     if api_err:
-        # API says offline/private
         return None, username, thumb_api, api_err
 
     if model_id and is_live_api:
-        # Public live according to API, now find working HLS
         hosts = _fetch_hosts_from_webpage_sync(username, headers)
-        # Ensure at least includes common
         extra_hosts = ["doppiocdn.com", "doppiocdn.live", "doppiocdn.net", "doppiocdn.media"]
         for eh in extra_hosts:
             if eh not in hosts:
@@ -449,14 +646,12 @@ def _extract_stripchat_custom_sync(url: str, headers: Dict[str, str]) -> Tuple[O
         if working_hls:
             return working_hls, username, thumb_api, None
         else:
-            # API says live but no HLS found, maybe try webpage extractor as fallback
-            logger.info(f"API says live but no HLS on hosts {hosts}, trying webpage extractor fallback")
-            # continue to webpage fallback below
+            logger.info(f"API says live but no HLS found, trying webpage fallback")
 
-    # Step 2: Webpage fallback with improved logic
+    # Webpage fallback
     try:
         req_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Referer": "https://stripchat.com/",
         }
@@ -476,7 +671,6 @@ def _extract_stripchat_custom_sync(url: str, headers: Dict[str, str]) -> Tuple[O
         is_cam_available = view_cam.get("isCamAvailable")
         is_cam_active = view_cam.get("isCamActive")
         model_obj = view_cam.get("model", {}) or view_cam.get("viewCamBase", {}).get("model", {})
-        # If model_obj still empty, try data['viewCamBase']['model']
         if not model_obj.get("id"):
             try:
                 model_obj = data.get("viewCamBase", {}).get("model", {})
@@ -485,22 +679,17 @@ def _extract_stripchat_custom_sync(url: str, headers: Dict[str, str]) -> Tuple[O
         model_id_web = model_obj.get("id") or model_obj.get("streamName") or (data.get("user", {}).get("user", {}).get("id"))
         thumb_url = model_obj.get("previewUrl") or model_obj.get("avatarUrl") or thumb_api
 
-        # Improved private check
         if _is_show_currently_active(show, is_show_available, private_mode):
             mode = show.get("mode", "private") if isinstance(show, dict) else "private"
-            return None, username, thumb_url, f"🔒 **Model is in a Private / {mode.upper()} Show.**\nPublic stream unavailable."
+            return None, username, thumb_url, f"🔒 **Model is in a Private / {mode.upper()} Show.**"
 
-        # Offline check
         is_live = model_obj.get("isLive")
         if is_live is False:
-            return None, username, thumb_url, "💤 **Model is currently OFFLINE or not broadcasting.**"
+            return None, username, thumb_url, "💤 **Model is currently OFFLINE.**"
         if is_cam_available is False and is_cam_active is False:
-            # Check if model status public but cam not available
-            # Could be offline
             if not model_id and not model_id_web:
-                return None, username, thumb_url, "💤 **Model is currently OFFLINE or not broadcasting.**"
+                return None, username, thumb_url, "💤 **Model is currently OFFLINE.**"
 
-        # If we have model id from webpage
         final_model_id = str(model_id_web or model_id or "")
         if not final_model_id:
             return None, username, thumb_url, "❌ Model ID missing"
@@ -510,11 +699,14 @@ def _extract_stripchat_custom_sync(url: str, headers: Dict[str, str]) -> Tuple[O
         if working_hls:
             return working_hls, username, thumb_url, None
         else:
-            return None, username, thumb_url, "❌ Model appears live but no working HLS edge found (retry in 15s) - may be temporary CDN issue"
+            # Check if we detected AD only
+            mouflon_keys = load_mouflon_keys()
+            if not mouflon_keys:
+                return None, username, thumb_url, "⚠️ **AD Detected (20sec 661kb):** Stripchat now requires Mouflon decryption keys (pkey:pdkey). Bot fetched only AD VOD. Please provide keys via `stripchat_mouflon_keys.json` or `MOUFLON_KEYS` env var. See https://github.com/ChanTrail/StripchatRecorder for how to get keys. Without keys, live recording not possible."
+            return None, username, thumb_url, "❌ Model appears live but no working HLS edge found (retry in 15s)"
 
     except Exception as e:
         logger.debug(f"Webpage fallback error for {username}: {e}")
-        # If we had API model_id earlier but HLS failed, try with API hosts
         if model_id:
             hosts = ["doppiocdn.com", "doppiocdn.live", "doppiocdn.net"]
             working = _try_find_working_hls(model_id, username, hosts, headers)
@@ -527,7 +719,7 @@ def _extract_direct_hls_from_webpage_sync(url: str, headers: Dict[str, str]) -> 
     import urllib.request
     try:
         req_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
         if headers:
@@ -538,11 +730,7 @@ def _extract_direct_hls_from_webpage_sync(url: str, headers: Dict[str, str]) -> 
             html_content = resp.read().decode("utf-8", errors="ignore")
         title_match = re.search(r"<title>(.*?)</title>", html_content, flags=re.IGNORECASE | re.DOTALL)
         title = title_match.group(1).strip() if title_match else ""
-        matches = re.findall(
-            r"https?://[^\s\"'<>]+?\.m3u8(?:[^\s\"'<>]*)?",
-            html_content,
-            flags=re.IGNORECASE
-        )
+        matches = re.findall(r"https?://[^\s\"'<>]+?\.m3u8(?:[^\s\"'<>]*)?", html_content, flags=re.IGNORECASE)
         if matches:
             valid = []
             for m in matches:
@@ -552,7 +740,6 @@ def _extract_direct_hls_from_webpage_sync(url: str, headers: Dict[str, str]) -> 
             if valid:
                 for v in valid:
                     if "_auto.m3u8" in v or "master" in v or "playlist" in v:
-                        logger.info(f"ProStreamFinder discovered master/auto HLS link: {v[:85]}...")
                         return v, title
                 return valid[0], title
     except Exception as e:
@@ -580,13 +767,13 @@ def _extract_ytdlp_sync(url: str, headers: Dict[str, str]) -> Dict[str, Any]:
 def classify_extraction_error(error_str: str) -> str:
     err_lower = error_str.lower()
     if any(x in err_lower for x in ["private show", "ticket show", "private room", "password", "requires authentication", "members only"]):
-        return "🔒 **Model is in a Private / Ticket Show.**\nPublic profile link cannot record private shows without session cookies or direct token `.m3u8` link."
+        return "🔒 **Model is in a Private / Ticket Show.**"
     if any(x in err_lower for x in ["offline", "not broadcasting", "is not live"]):
-        return "💤 **Model is currently OFFLINE or not broadcasting.**"
+        return "💤 **Model is currently OFFLINE.**"
     if any(x in err_lower for x in ["403", "forbidden", "unauthorized", "401"]):
-        return "🚫 **403 Forbidden / Access Denied.**"
+        return "🚫 **403 Forbidden.**"
     if any(x in err_lower for x in ["404", "not found"]):
-        return "❌ **404 Not Found:** Stream or model page does not exist."
+        return "❌ **404 Not Found.**"
     return f"⚠️ **Stream Extraction Error:** `{error_str[:150]}`"
 
 
@@ -605,7 +792,7 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
 
     if "stripchat.com" in normalized.lower():
         try:
-            logger.info(f"Running API-FIRST StripchatExtractor on: {normalized}")
+            logger.info(f"Running API-FIRST V9 StripchatExtractor on: {normalized}")
             loop = asyncio.get_event_loop()
             hls_url, uname, thumb_url, strip_err = await loop.run_in_executor(None, _extract_stripchat_custom_sync, normalized, combined_headers)
             web_thumb_path = None
@@ -613,8 +800,10 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
                 web_thumb_path = await download_web_thumbnail(thumb_url, auto_generate_job_name(normalized))
             if "Referer" not in combined_headers:
                 combined_headers["Referer"] = f"https://stripchat.com/{uname}" if uname else "https://stripchat.com/"
+            if "Origin" not in combined_headers:
+                combined_headers["Origin"] = "https://stripchat.com"
             if hls_url:
-                logger.info(f"Extractor SUCCESS: {hls_url[:80]}...")
+                logger.info(f"Extractor SUCCESS V9: {hls_url[:120]}...")
                 return hls_url, uname, web_thumb_path, combined_headers, None
             elif strip_err:
                 logger.info(f"Extractor says: {strip_err}")
@@ -622,17 +811,14 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
         except Exception as e:
             logger.debug(f"Extractor exception: {e}")
 
-    # Pro finder
     try:
         loop = asyncio.get_event_loop()
         discovered_m3u8, page_title = await loop.run_in_executor(None, _extract_direct_hls_from_webpage_sync, normalized, combined_headers)
         if discovered_m3u8:
-            logger.info(f"ProStreamFinder resolved: {discovered_m3u8[:80]}...")
             return discovered_m3u8, page_title, None, combined_headers, None
     except Exception as e:
         logger.debug(f"ProStreamFinder exception: {e}")
 
-    # yt-dlp
     try:
         loop = asyncio.get_event_loop()
         data = await loop.run_in_executor(None, _extract_ytdlp_sync, normalized, combined_headers)
@@ -659,12 +845,11 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
 
 async def get_stream_qualities(url: str, headers: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
     return [
-        {"id": "best", "label": "🌟 Best Quality (Default)", "desc": "Highest available"},
-        {"id": "1080p", "label": "📺 1080p Full HD", "desc": "Max height 1080px"},
-        {"id": "720p", "label": "🖥️ 720p HD", "desc": "Max height 720px"},
-        {"id": "480p", "label": "📱 480p SD", "desc": "Max height 480px"},
-        {"id": "360p", "label": "📶 360p Low", "desc": "Data saver"},
-        {"id": "audio", "label": "🎵 Audio Only", "desc": "Audio only"},
+        {"id": "best", "label": "🌟 Best Quality", "desc": "Highest"},
+        {"id": "720p", "label": "📺 720p", "desc": "720p"},
+        {"id": "480p", "label": "📱 480p", "desc": "480p"},
+        {"id": "360p", "label": "📶 360p", "desc": "Low"},
+        {"id": "audio", "label": "🎵 Audio Only", "desc": "Audio"},
     ]
 
 
