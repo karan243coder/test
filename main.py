@@ -86,6 +86,7 @@ active_jobs: Dict[str, Dict[str, Any]] = {}
 auto_restart_count: Dict[str, int] = {}   # job_name -> restarts used
 
 _BOOT_TIME = time.time()
+_last_update_time = time.time()   # watchdog ke liye
 
 app = Client("recorder_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir=".")
 user_app = None
@@ -710,6 +711,37 @@ async def delete_old_webhook():
 #  TELEGRAM HANDLERS
 # ============================================================
 
+# ============================================================
+#  GLOBAL INCOMING-MESSAGE LOGGER (diagnostic - sabse pehle run)
+#  Koyeb logs mein "[INCOMING]" dikhega toh bot updates receive
+#  kar raha hai. Nahin dikhega = updates delivery problem.
+# ============================================================
+
+@app.on_message(filters.all, group=0)
+async def debug_log_all(client, message: Message):
+    global _last_update_time
+    _last_update_time = time.time()
+    try:
+        txt = (message.text or message.caption or "")[:100]
+        uid = message.from_user.id if message.from_user else "?"
+        uname = message.from_user.username if message.from_user and message.from_user.username else ""
+        chat = message.chat.id if message.chat else "?"
+        ctype = message.chat.type if message.chat else "?"
+        logger.info(f"[INCOMING] uid={uid} @{uname} chat={chat} type={ctype} text={txt!r}")
+    except Exception:
+        pass
+
+
+async def update_watchdog():
+    """Agar 5 min se koi update nahi aaya -> polling dead/conflicted."""
+    while True:
+        await asyncio.sleep(120)
+        idle_secs = time.time() - _last_update_time
+        if idle_secs > 300:
+            logger.warning(f"⚠️ NO INCOMING UPDATES for {idle_secs:.0f}s - "
+                           f"koi aur instance/webhook same bot token use kar raha hai?")
+
+
 @app.on_message(filters.command(["start", "help"]))
 async def start_cmd(client, message: Message):
     if not check_auth(message.from_user.id):
@@ -1109,18 +1141,20 @@ async def ping_cmd(client, message: Message):
     try:
         me = await app.get_me()
         uptime = time.time() - _BOOT_TIME
+        idle_secs = time.time() - _last_update_time
         await safe_send_text(
             message.chat.id,
             f"🏓 **PONG! Bot alive hai** ✅\n"
             f"🤖 @{me.username}\n"
             f"⏱ Uptime: `{system_stats.format_duration_human(uptime)}`\n"
+            f"📥 Last update: `{idle_secs:.0f}s` pehle\n"
             f"🔴 Active jobs: `{len(active_jobs)}` | ⏳ Queue: `{len(database.get_queue_jobs())}`\n"
             f"🔑 Keys: `{len(media_utils.get_mouflon_keys())}`\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"💡 Agar link pe respond nahi karta:\n"
             f"1️⃣ Group mein ho? BotFather → `/setprivacy` → **Disable** karo\n"
             f"2️⃣ DM mein bhejo\n"
-            f"3️⃣ `/start` pe respond karta hai? Nahi → bot down hai")
+            f"3️⃣ Koyeb logs mein `[INCOMING]` check karo")
     except Exception as e:
         logger.error(f"ping error: {e}")
         try:
@@ -1361,6 +1395,19 @@ async def main():
     try:
         me = await app.get_me()
         logger.info(f"Bot @{me.username} online")
+        # webhook status check - agar koi webhook set hai toh polling updates nahi lega
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as sess:
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
+                async with sess.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    info = await resp.json()
+                    result = info.get("result", {})
+                    logger.info(f"getWebhookInfo: url={result.get('url')!r} "
+                                f"pending={result.get('pending_update_count')} "
+                                f"last_error={str(result.get('last_error_message'))[:80]}")
+        except Exception as e:
+            logger.warning(f"getWebhookInfo fail: {e}")
         if OWNER_ID:
             keys_count = len(media_utils.get_mouflon_keys())
             await safe_send_text(
@@ -1374,6 +1421,7 @@ async def main():
         logger.warning(f"Boot notification failed (owner check): {e}")
 
     watch_task = asyncio.create_task(watcher_loop())
+    asyncio.create_task(update_watchdog())  # diagnostics: no-update alert
     logger.info(f"Bot started - PORT {PORT} | max jobs {MAX_CONCURRENT_JOBS} | "
                 f"watch interval {database.get_setting('watch_interval', WATCH_INTERVAL)}s")
     await recover_interrupted_jobs()
