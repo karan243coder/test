@@ -176,8 +176,8 @@ def parse_record_command(text: str) -> Tuple[Optional[str], Optional[str], int, 
     job_name = ""
     username = extract_username_from_url(url) if is_stripchat_url(url) else ""
     for tok in main.split():
-        if tok.lower().startswith(("http://", "https://", "rtmp://", "srt://", "rtsp://")):
-            break
+        if "http://" in tok.lower() or "https://" in tok.lower():
+            break  # URL token (chaahe uske aage ] [ junk laga ho)
         if re.match(r"^\d+[smh]?$", tok.lower()):
             continue
         if tok and not job_name:
@@ -185,6 +185,7 @@ def parse_record_command(text: str) -> Tuple[Optional[str], Optional[str], int, 
     if not job_name:
         job_name = auto_generate_job_name(url, username)
     job_name = re.sub(r"[^a-zA-Z0-9_-]", "_", job_name)[:35]
+    job_name = job_name.strip("_") or "stream"
 
     return job_name, url, duration_limit, headers, quality
 
