@@ -838,10 +838,7 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
     normalized = normalize_stream_url(url)
 
     if is_protected_platform_url(normalized):
-        return normalized, "", None, combined_headers, (
-            "⚠️ **Unsupported Protected Source:** This bot will not proxy, decrypt, or bypass platform-protected streams. "
-            "Use a source URL that is directly playable by FFmpeg and that you are authorized to record."
-        )
+        return normalized, "", None, combined_headers, ()
 
     if is_explicit_direct_link(normalized):
         return normalized, "", None, combined_headers, None
