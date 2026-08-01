@@ -530,7 +530,6 @@ async def start_recording_job(chat_id: int, job_name: str, url: str, duration_li
         "-reconnect_delay_max", "10",
         "-rw_timeout", "15000000",
         "-max_muxing_queue_size", "1024",  # Prevents RAM overflow on 512MB Koyeb server
-        "-ignore_endlist", "1",  # Keeps recording live stream even after pre-roll ad #EXT-X-ENDLIST
     ]
 
     # Add custom HTTP Headers if specified
