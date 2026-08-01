@@ -85,6 +85,8 @@ logger = logging.getLogger("recorder_bot")
 active_jobs: Dict[str, Dict[str, Any]] = {}
 auto_restart_count: Dict[str, int] = {}   # job_name -> restarts used
 
+_BOOT_TIME = time.time()
+
 app = Client("recorder_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir=".")
 user_app = None
 if STRING_SESSION:
@@ -192,7 +194,22 @@ async def start_recording_job(chat_id: int, job_name: str, url: str,
                               source: str = "manual",
                               watch_chat_id: Optional[int] = None):
     headers = headers or {}
-    resolved = await media_utils.resolve_stream_url(url, headers)
+
+    # hang guard: resolver kabhi 45s se zyada na le
+    try:
+        resolved = await asyncio.wait_for(
+            media_utils.resolve_stream_url(url, headers), timeout=45)
+    except asyncio.TimeoutError:
+        await safe_send_text(chat_id,
+                             f"⏱ **Stream resolve timeout (45s)** — `{esc(job_name)}`\n"
+                             f"Network slow hai ya model busy hai. Dobara try karo ya `/watch` laga do.")
+        return False
+    except Exception as e:
+        logger.error(f"resolve crash for {job_name}: {e}", exc_info=True)
+        await safe_send_text(chat_id,
+                             f"⚠️ **Resolver error:** `{esc(str(e)[:150])}`\n"
+                             f"Job `{esc(job_name)}` start nahi hui. Log check karo.")
+        return False
 
     if resolved.get("error"):
         await safe_send_text(
@@ -749,34 +766,79 @@ async def record_cmd(client, message: Message):
             await safe_send_text(message.chat.id,
                                  f"⏳ **Busy** — `{esc(job_name)}` queue #{pos} pe laga diya.")
         return
-    await start_recording_job(message.chat.id, job_name, url, duration_limit, headers, quality)
+    ack = await safe_send_text(message.chat.id,
+                               f"✅ **Recording request mila!**\n📌 `{esc(job_name)}`\n🔍 Stream resolve ho raha hai...")
+    try:
+        ok = await start_recording_job(message.chat.id, job_name, url, duration_limit, headers, quality)
+        if not ok and ack:
+            await safe_edit_message(message.chat.id, ack.id,
+                                    f"❌ Recording start nahi ho payi `{esc(job_name)}`. Error upar dekho.")
+    except Exception as e:
+        logger.error(f"record_cmd crash: {e}", exc_info=True)
+        if ack:
+            try:
+                await safe_edit_message(message.chat.id, ack.id,
+                                        f"⚠️ **Internal error:** `{esc(str(e)[:200])}`")
+            except Exception:
+                pass
 
 
 @app.on_message(filters.text & ~filters.command(["start", "help", "record", "watch", "unwatch",
                                                  "watchlist", "watchinterval", "check", "stop",
                                                  "status", "queue", "stats", "server", "mode",
-                                                 "addsudo", "rmsudo", "sudolist", "clean"]))
+                                                 "addsudo", "rmsudo", "sudolist", "clean",
+                                                 "keys", "resynckeys", "ping"]))
 async def auto_url_handler(client, message: Message):
     if not check_auth(message.from_user.id):
+        await safe_send_text(message.chat.id,
+                             f"❌ **Access Denied.** Tumhe authorize nahi kiya gaya. Contact owner `{OWNER_ID}`.")
         return
     urls = media_utils.extract_urls_from_text(message.text)
     if not urls:
         return
     url = media_utils.normalize_stream_url(urls[0])
-    job_name, _, duration_limit, headers, quality = media_utils.parse_record_command(f"/record {message.text}")
-    if not job_name:
-        return
-    if job_name in active_jobs:
-        await safe_send_text(message.chat.id, f"❌ Duplicate: `{esc(job_name)}` already recording.")
-        return
-    if len(active_jobs) >= MAX_CONCURRENT_JOBS:
-        pos = database.add_queue_job({"job_name": job_name, "url": url, "chat_id": message.chat.id,
-                                      "duration_limit": duration_limit, "headers": headers,
-                                      "quality": quality})
-        if pos is not None:
-            await safe_send_text(message.chat.id, f"⏳ Queued (#{pos}) `{esc(job_name)}`")
-        return
-    await start_recording_job(message.chat.id, job_name, url, duration_limit, headers, quality)
+
+    # INSTANT ACK - user ko turant pata chale ki bot ne message dekha
+    ack = await safe_send_text(
+        message.chat.id,
+        f"✅ **Link mil gaya!**\n🔗 `{esc(url)}`\n🔍 Stream resolve ho raha hai, thodi der...")
+    try:
+        job_name, _, duration_limit, headers, quality = media_utils.parse_record_command(f"/record {message.text}")
+        if not job_name:
+            if ack:
+                await safe_edit_message(message.chat.id, ack.id,
+                                        f"❌ Is link se koi valid stream nahi mila.\n`{esc(url)}`")
+            return
+        if job_name in active_jobs:
+            if ack:
+                await safe_edit_message(message.chat.id, ack.id,
+                                        f"❌ Duplicate: `{esc(job_name)}` already recording hai.")
+            return
+        if len(active_jobs) >= MAX_CONCURRENT_JOBS:
+            pos = database.add_queue_job({"job_name": job_name, "url": url, "chat_id": message.chat.id,
+                                          "duration_limit": duration_limit, "headers": headers,
+                                          "quality": quality})
+            if ack:
+                if pos is not None:
+                    await safe_edit_message(message.chat.id, ack.id,
+                                            f"⏳ **Busy** — `{esc(job_name)}` queue #{pos} pe laga diya.")
+                else:
+                    await safe_edit_message(message.chat.id, ack.id,
+                                            f"❌ `{esc(job_name)}` already queue mein hai.")
+            return
+        ok = await start_recording_job(message.chat.id, job_name, url, duration_limit, headers, quality)
+        if not ok and ack:
+            await safe_edit_message(message.chat.id, ack.id,
+                                    f"❌ Recording start nahi ho payi `{esc(job_name)}`. "
+                                    f"Upar wala error dekho ya `/check {esc(job_name)}` try karo.")
+    except Exception as e:
+        logger.error(f"auto_url_handler crash: {e}", exc_info=True)
+        if ack:
+            try:
+                await safe_edit_message(message.chat.id, ack.id,
+                                        f"⚠️ **Internal error:** `{esc(str(e)[:200])}`\nLog check karo.")
+            except Exception:
+                pass
 
 
 @app.on_message(filters.command("watch"))
@@ -1041,6 +1103,32 @@ async def clean_cmd(client, message: Message):
     await safe_send_text(message.chat.id, f"🧹 Cleanup done — `{system_stats.format_size(freed)}` free hua.")
 
 
+@app.on_message(filters.command("ping"))
+async def ping_cmd(client, message: Message):
+    """Quick alive check - har user ke liye (auth nahi chahiye)."""
+    try:
+        me = await app.get_me()
+        uptime = time.time() - _BOOT_TIME
+        await safe_send_text(
+            message.chat.id,
+            f"🏓 **PONG! Bot alive hai** ✅\n"
+            f"🤖 @{me.username}\n"
+            f"⏱ Uptime: `{system_stats.format_duration_human(uptime)}`\n"
+            f"🔴 Active jobs: `{len(active_jobs)}` | ⏳ Queue: `{len(database.get_queue_jobs())}`\n"
+            f"🔑 Keys: `{len(media_utils.get_mouflon_keys())}`\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"💡 Agar link pe respond nahi karta:\n"
+            f"1️⃣ Group mein ho? BotFather → `/setprivacy` → **Disable** karo\n"
+            f"2️⃣ DM mein bhejo\n"
+            f"3️⃣ `/start` pe respond karta hai? Nahi → bot down hai")
+    except Exception as e:
+        logger.error(f"ping error: {e}")
+        try:
+            await safe_send_text(message.chat.id, f"⚠️ Ping fail: `{esc(str(e)[:150])}`")
+        except Exception:
+            pass
+
+
 @app.on_message(filters.command("keys"))
 async def keys_cmd(client, message: Message):
     if not check_auth(message.from_user.id):
@@ -1268,6 +1356,22 @@ async def main():
             logger.info("💎 Premium userbot started (4GB uploads)")
         except Exception as e:
             logger.error(f"Userbot start failed: {e}")
+
+    # boot notification -> owner ko pata chale bot online hai
+    try:
+        me = await app.get_me()
+        logger.info(f"Bot @{me.username} online")
+        if OWNER_ID:
+            keys_count = len(media_utils.get_mouflon_keys())
+            await safe_send_text(
+                OWNER_ID,
+                f"✅ **BOT ONLINE** (@{me.username})\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔑 MOUFLON keys: `{keys_count}`\n"
+                f"⚙️ Max jobs: `{MAX_CONCURRENT_JOBS}` | Watch: `{str(database.get_setting('watch_interval', WATCH_INTERVAL))}s`\n"
+                f"🚀 Ready! Link bhejo ya `/watch <link>` karo.")
+    except Exception as e:
+        logger.warning(f"Boot notification failed (owner check): {e}")
 
     watch_task = asyncio.create_task(watcher_loop())
     logger.info(f"Bot started - PORT {PORT} | max jobs {MAX_CONCURRENT_JOBS} | "
