@@ -254,6 +254,33 @@ def normalize_stream_url(url: str) -> str:
     return url_clean
 
 
+def is_protected_platform_url(url: str) -> bool:
+    url_lower = (url or "").lower()
+    return (
+        "stripchat.com/" in url_lower
+        or "stripchatgirls.com/" in url_lower
+        or "doppiocdn" in url_lower
+        or ("edge-hls." in url_lower and "/hls/" in url_lower)
+    )
+
+
+def is_valid_hls_playlist_text(content: str) -> bool:
+    if not content or "#EXTM3U" not in content:
+        return False
+    media_lines = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        media_lines.append(line)
+    if not media_lines:
+        return False
+    if "media.mp4" in content or "#EXT-X-MOUFLON:" in content:
+        return False
+    valid_exts = (".m3u8", ".ts", ".m4s", ".mp4", ".aac", ".m4a")
+    return any(any(ext in line for ext in valid_exts) for line in media_lines)
+
+
 def auto_generate_job_name(url: str) -> str:
     try:
         url_clean = url.split("?")[0].split("#")[0].rstrip("/")
@@ -321,14 +348,10 @@ def parse_record_command(text: str) -> Tuple[Optional[str], Optional[str], int, 
 
 def is_explicit_direct_link(url: str) -> bool:
     url_lower = url.lower()
-    if "stripchat.com/" in url_lower and ".m3u8" not in url_lower:
-        if "doppiocdn" not in url_lower and "edge-hls" not in url_lower:
-            return False
+    if is_protected_platform_url(url_lower):
+        return False
     if any(x in url_lower for x in [".m3u8", ".mp4", ".m4a", ".ts", ".mpd"]):
-        if ".m3u8" in url_lower or url_lower.startswith("https://edge-hls") or "doppiocdn" in url_lower:
-            return True
-        if "stripchat.com/" not in url_lower:
-            return True
+        return True
     if any(url_lower.startswith(proto) for proto in ["rtmp://", "srt://", "rtsp://"]):
         return True
     return False
@@ -814,32 +837,14 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
 
     normalized = normalize_stream_url(url)
 
-    if is_explicit_direct_link(normalized):
-        if "stripchat" in normalized.lower() or "doppiocdn" in normalized.lower():
-            if "Referer" not in combined_headers:
-                combined_headers["Referer"] = "https://stripchat.com/"
-        return normalized, "", None, combined_headers, None
+    if is_protected_platform_url(normalized):
+        return normalized, "", None, combined_headers, (
+            "⚠️ **Unsupported Protected Source:** This bot will not proxy, decrypt, or bypass platform-protected streams. "
+            "Use a source URL that is directly playable by FFmpeg and that you are authorized to record."
+        )
 
-    if "stripchat.com" in normalized.lower():
-        try:
-            logger.info(f"Running API-FIRST V9 StripchatExtractor on: {normalized}")
-            loop = asyncio.get_event_loop()
-            hls_url, uname, thumb_url, strip_err = await loop.run_in_executor(None, _extract_stripchat_custom_sync, normalized, combined_headers)
-            web_thumb_path = None
-            if thumb_url:
-                web_thumb_path = await download_web_thumbnail(thumb_url, auto_generate_job_name(normalized))
-            if "Referer" not in combined_headers:
-                combined_headers["Referer"] = f"https://stripchat.com/{uname}" if uname else "https://stripchat.com/"
-            if "Origin" not in combined_headers:
-                combined_headers["Origin"] = "https://stripchat.com"
-            if hls_url:
-                logger.info(f"Extractor SUCCESS V9: {hls_url[:120]}...")
-                return hls_url, uname, web_thumb_path, combined_headers, None
-            elif strip_err:
-                logger.info(f"Extractor says: {strip_err}")
-                return normalized, uname, web_thumb_path, combined_headers, strip_err
-        except Exception as e:
-            logger.debug(f"Extractor exception: {e}")
+    if is_explicit_direct_link(normalized):
+        return normalized, "", None, combined_headers, None
 
     try:
         loop = asyncio.get_event_loop()
