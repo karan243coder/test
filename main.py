@@ -561,7 +561,9 @@ async def start_recording_job(chat_id: int, job_name: str, url: str, duration_li
     file_path = f"{RECORDINGS_DIR}/{job_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
     ffmpeg_log_path = f"{RECORDINGS_DIR}/{job_name}_ffmpeg.log"
 
-    # ---------- FIXED FFMPEG COMMAND ----------
+    # ---------- FIXED FFMPEG COMMAND (V7 - option order fixed) ----------
+    # Input options MUST be before -i
+    # Output options (max_muxing_queue_size, c, movflags) MUST be after -i
     cmd = [
         "ffmpeg", "-y",
         "-hide_banner",
@@ -571,7 +573,6 @@ async def start_recording_job(chat_id: int, job_name: str, url: str, duration_li
         "-reconnect_delay_max", "10",
         "-rw_timeout", "15000000",
         "-fflags", "+genpts+discardcorrupt",
-        "-max_muxing_queue_size", "1024",
     ]
 
     # Add headers - ensure Referer for stripchat/doppiocdn
@@ -599,9 +600,9 @@ async def start_recording_job(chat_id: int, job_name: str, url: str, duration_li
     cmd.extend(["-i", resolved_url])
 
     if quality == "audio":
-        cmd.extend(["-vn", "-c:a", "copy"])
+        cmd.extend(["-vn", "-c:a", "copy", "-max_muxing_queue_size", "1024"])
     else:
-        cmd.extend(["-c", "copy", "-movflags", "+faststart"])
+        cmd.extend(["-c", "copy", "-max_muxing_queue_size", "1024", "-movflags", "+faststart"])
 
     cmd.append(file_path)
 
