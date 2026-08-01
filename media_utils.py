@@ -1,6 +1,7 @@
 """
 media_utils.py - Level 1 & Level 2 Media & Stream Handling Utilities (512MB RAM Koyeb Optimized)
 Handles:
+  - PRO Direct Stream Finder (extracts master/auto .m3u8 directly from simple webpage URLs)
   - Smart Automatic Job Name Generation from URLs
   - Command Parsing (/record <url>, timed flags, quality selection, custom headers)
   - URL Normalization (mirror domains -> canonical domain for yt-dlp extractors)
@@ -123,7 +124,6 @@ def parse_record_command(text: str) -> Tuple[Optional[str], Optional[str], int, 
                 if not job_name:
                     job_name = auto_generate_job_name(url)
             elif not job_name or job_name == auto_generate_job_name(url):
-                # If token is a word and url wasn't seen yet (or override auto name)
                 job_name = tok
 
     if not job_name and url:
@@ -140,6 +140,59 @@ def is_explicit_direct_link(url: str) -> bool:
     if any(url_lower.startswith(proto) for proto in ["rtmp://", "srt://", "rtsp://"]):
         return True
     return False
+
+
+def _extract_direct_hls_from_webpage_sync(url: str, headers: Dict[str, str]) -> Tuple[Optional[str], str]:
+    """
+    PRO DIRECT LINK FINDER (Synchronous worker):
+    Fetches the webpage HTML and any embedded script/JSON data, scans for live .m3u8 stream URLs,
+    filters out blurred/preview streams, and returns the best master/auto .m3u8 link.
+    Returns: (best_m3u8_url_or_none, extracted_page_title)
+    """
+    import urllib.request
+    try:
+        req_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        if headers:
+            for k, v in headers.items():
+                req_headers[k] = v
+
+        req = urllib.request.Request(url, headers=req_headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            html_content = resp.read().decode("utf-8", errors="ignore")
+
+        # Extract title from <title>...</title>
+        title_match = re.search(r"<title>(.*?)</title>", html_content, flags=re.IGNORECASE | re.DOTALL)
+        title = title_match.group(1).strip() if title_match else ""
+
+        # Find all .m3u8 links in HTML or embedded JSON
+        matches = re.findall(
+            r"https?://[^\s\"\'<>]+?\.m3u8(?:[^\s\"\'<>]*)?",
+            html_content,
+            flags=re.IGNORECASE
+        )
+
+        if matches:
+            valid = []
+            for m in matches:
+                m_clean = m.replace("\\u0026", "&").replace("\\/", "/")
+                if not any(bad in m_clean.lower() for bad in ["_blurred", "preview", "thumb", "sample"]):
+                    valid.append(m_clean)
+
+            if valid:
+                for v in valid:
+                    if "_auto.m3u8" in v or "master" in v or "playlist" in v:
+                        logger.info(f"ProStreamFinder discovered master/auto HLS link: {v[:85]}...")
+                        return v, title
+                logger.info(f"ProStreamFinder discovered valid HLS link: {valid[0][:85]}...")
+                return valid[0], title
+
+    except Exception as e:
+        logger.debug(f"ProStreamFinder HTML check fallback: {e}")
+
+    return None, ""
 
 
 async def download_web_thumbnail(thumbnail_url: str, job_name: str) -> Optional[str]:
@@ -199,8 +252,11 @@ def classify_extraction_error(error_str: str) -> str:
 
 async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[str, str, Optional[str], Dict[str, str], Optional[str]]:
     """
-    Resolves public web page URLs (YouTube, live streams, video pages) to a direct stream/m3u8 URL using yt-dlp.
-    If it's already an explicit direct media URL, returns it as is.
+    Resolves public web page URLs (YouTube, live streams, video pages) to a direct stream/m3u8 URL.
+    Uses multi-stage resolution:
+      1) Pro Direct Stream Finder (scans HTML/JSON for master/auto HLS links)
+      2) Python yt-dlp library
+      3) Subprocess CLI yt-dlp
     Returns: (resolved_direct_url, title, web_thumbnail_path, combined_headers, error_message)
     """
     combined_headers = {}
@@ -209,7 +265,22 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
 
     normalized = normalize_stream_url(url)
 
-    # 1. Try Python yt_dlp library first
+    # 0. If explicit direct link, return immediately
+    if is_explicit_direct_link(normalized):
+        return normalized, "", None, combined_headers, None
+
+    # 1. Pro Direct Stream Finder (scans webpage HTML/JSON for valid HLS links)
+    try:
+        logger.info(f"Running ProStreamFinder on: {normalized}")
+        loop = asyncio.get_event_loop()
+        discovered_m3u8, page_title = await loop.run_in_executor(None, _extract_direct_hls_from_webpage_sync, normalized, combined_headers)
+        if discovered_m3u8:
+            logger.info(f"ProStreamFinder resolved direct HLS link: {discovered_m3u8[:80]}...")
+            return discovered_m3u8, page_title, None, combined_headers, None
+    except Exception as e:
+        logger.debug(f"ProStreamFinder check exception: {e}")
+
+    # 2. Try Python yt_dlp library
     try:
         logger.info(f"Resolving URL via Python yt-dlp library: {normalized}")
         loop = asyncio.get_event_loop()
@@ -241,7 +312,7 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
         if not is_explicit_direct_link(normalized):
             return normalized, "", None, combined_headers, classify_extraction_error(err_msg)
 
-    # 2. Fallback to CLI subprocess yt-dlp
+    # 3. Fallback to CLI subprocess yt-dlp
     try:
         cmd = [
             "yt-dlp",
@@ -291,7 +362,7 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
     except Exception as e:
         logger.debug(f"yt-dlp CLI extraction fallback error for {normalized}: {e}")
 
-    # 3. Fallback to normalized URL if direct or unresolved
+    # 4. Fallback to normalized URL if direct or unresolved
     return normalized, "", None, combined_headers, None
 
 
