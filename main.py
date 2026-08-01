@@ -4,7 +4,7 @@ Koyeb + GitHub Ready | 100% Bug-Free | Level 1 + Level 2 + Level 3 Features
 
 Features Included:
   1. 100% Automatic Direct Link Recognition (Send any URL in chat -> Auto Records!)
-  2. Smart Auto Job Naming from URLs (e.g., /record https://.../model -> job 'model')
+  2. Custom Pure-Python Stripchat Extractor (No yt-dlp dependency — instant CDN resolution)
   3. Smart Error Detection (Private Show / Ticket Show / Offline alert without 0-byte fail)
   4. Web Thumbnail Display in Telegram Status Header + Playable Video Cover Thumbnail
   5. Custom HTTP Headers (Referer, User-Agent, Cookie) support via pipe syntax
@@ -504,7 +504,7 @@ async def check_and_start_queued_job():
 async def start_recording_job(chat_id: int, job_name: str, url: str, duration_limit: int = 0, headers: Dict[str, str] = None, quality: str = "best"):
     headers = headers or {}
 
-    # 1. Resolve public webpage URL to direct stream via yt-dlp + extract web thumbnail & error analysis
+    # 1. Resolve public webpage URL to direct stream via Custom Extractor + extract web thumbnail & error analysis
     resolved_url, title, web_thumb_path, combined_headers, err_msg = await media_utils.resolve_stream_url(url, headers)
 
     # 2. Smart Error Check: Prevent 0-byte FFmpeg fail if model is Private Show or Offline
@@ -530,6 +530,7 @@ async def start_recording_job(chat_id: int, job_name: str, url: str, duration_li
         "-reconnect_delay_max", "10",
         "-rw_timeout", "15000000",
         "-max_muxing_queue_size", "1024",  # Prevents RAM overflow on 512MB Koyeb server
+        "-ignore_endlist", "1",  # Keeps recording live stream even after pre-roll ad #EXT-X-ENDLIST
     ]
 
     # Add custom HTTP Headers if specified
@@ -542,13 +543,16 @@ async def start_recording_job(chat_id: int, job_name: str, url: str, duration_li
 
     if header_str:
         cmd.extend(["-headers", header_str])
+    else:
+        cmd.extend(["-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"])
 
     cmd.extend(["-i", resolved_url])
 
     if quality == "audio":
         cmd.extend(["-vn", "-c:a", "copy"])
     else:
-        cmd.extend(["-c", "copy", "-bsf:a", "aac_adtstoasc"])
+        # -c copy works for both legacy MPEG-TS (.ts) and modern fragmented MP4 (.m4s) HLS streams
+        cmd.extend(["-c", "copy"])
 
     cmd.append(file_path)
 
@@ -636,7 +640,7 @@ async def start_cmd(client, message: Message):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "🚀 **Key Features Enabled:**\n"
         "  • 🤖 **100% Automatic Mode:** Paste any URL in chat -> Auto Records immediately!\n"
-        "  • 🌐 **Public URLs & Direct HLS:** Extracted automatically via yt-dlp.\n"
+        "  • 🌐 **Custom Pro Extractor:** 100% Custom Pure-Python engine for Stripchat & direct streams.\n"
         "  • 🛡️ **Smart Private/Offline Guard:** Tells you why Private Shows fail before recording.\n"
         "  • 🖼 **Web Thumbnail Header:** Displays public thumbnail image at top of status message.\n"
         "  • 🔐 **Admin Authorized:** Sudo users & owner protected.\n"
@@ -745,7 +749,6 @@ async def auto_url_message_handler(client, message: Message):
     text = message.text.strip()
     if any(text.lower().startswith(p) for p in ["http://", "https://", "rtmp://", "srt://", "rtsp://"]):
         logger.info(f"Auto-detected direct URL in text message: {text[:60]}")
-        # Parse text as if `/record <text>`
         job_name, url, duration_limit, headers, quality = parse_record_command(f"/record {text}")
         if not job_name or not url:
             return
