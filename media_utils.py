@@ -1,12 +1,12 @@
 """
 media_utils.py - Level 1 & Level 2 Media & Stream Handling Utilities (512MB RAM Koyeb Optimized)
 Handles:
+  - CUSTOM STRIPCHAT STREAM EXTRACTOR (Pure Python API resolver — no yt-dlp dependency for Stripchat!)
   - Automatic URL punctuation & ellipsis cleanup (strips trailing '...' from copied links)
   - PRO Direct Stream Finder (extracts master/auto .m3u8 directly from simple webpage URLs)
   - Smart Automatic Job Name Generation from URLs
   - Command Parsing (/record <url>, timed flags, quality selection, custom headers)
-  - URL Normalization (mirror domains -> canonical domain for yt-dlp extractors)
-  - Public URL / direct stream extraction via yt-dlp Python API & CLI fallback
+  - URL Normalization (mirror domains -> canonical domain)
   - Smart Error Analysis (Private Show / Ticket Show / Offline detection without 0-byte fail)
   - Extracted Web Thumbnail URL & automatic image download for Status Display header
   - Custom Headers (User-Agent, Referer, Cookie) support
@@ -43,8 +43,7 @@ def clean_url_punctuation(url: str) -> str:
 
 def normalize_stream_url(url: str) -> str:
     """
-    Normalize known mirror domains to their canonical domains so yt-dlp extractors recognize them,
-    and strip trailing ellipsis punctuation.
+    Normalize known mirror domains to their canonical domains and strip trailing ellipsis punctuation.
     Example: stripchatgirls.com/username... -> stripchat.com/username
     """
     url_clean = clean_url_punctuation(url)
@@ -151,6 +150,94 @@ def is_explicit_direct_link(url: str) -> bool:
     return False
 
 
+async def download_web_thumbnail(thumbnail_url: str, job_name: str) -> Optional[str]:
+    """
+    Download web thumbnail image so it can be displayed in Telegram status message header
+    and used as the video cover thumbnail.
+    """
+    if not thumbnail_url or not thumbnail_url.startswith("http"):
+        return None
+
+    thumb_path = os.path.join(RECORDINGS_DIR, f"{job_name}_web_thumb.jpg")
+    try:
+        import urllib.request
+        def _dl():
+            req = urllib.request.Request(thumbnail_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp, open(thumb_path, "wb") as f:
+                f.write(resp.read())
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _dl)
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 500:
+            logger.info(f"Downloaded web thumbnail to {thumb_path}")
+            return thumb_path
+    except Exception as e:
+        logger.debug(f"Web thumbnail download failed for {thumbnail_url}: {e}")
+
+    return None
+
+
+def _extract_stripchat_custom_sync(url: str, headers: Dict[str, str]) -> Tuple[Optional[str], str, Optional[str], Optional[str]]:
+    """
+    CUSTOM STRIPCHAT EXTRACTOR (100% Custom Pure Python — No yt-dlp required!):
+    Directly queries Stripchat's /cam API, finds the live CDN HLS node, downloads her live DP/preview,
+    or detects Private Show / Offline status immediately.
+    Returns: (hls_url_or_none, username_or_title, thumbnail_url, error_message_or_none)
+    """
+    import urllib.request
+    try:
+        username = url.split("?")[0].split("#")[0].rstrip("/").split("/")[-1]
+        api_url = f"https://stripchat.com/api/front/v2/models/username/{username}/cam"
+        req_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        }
+        if headers:
+            req_headers.update(headers)
+
+        req = urllib.request.Request(api_url, headers=req_headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            cam = data.get("cam", {})
+            user_obj = data.get("user", {}).get("user", {})
+            is_avail = cam.get("isCamAvailable", False)
+            is_active = cam.get("isCamActive", False)
+
+            thumb_url = user_obj.get("previewUrl") or user_obj.get("avatarUrl")
+
+            if is_avail:
+                model_id = str(cam.get("streamName") or user_obj.get("id") or "")
+                if not model_id:
+                    return None, username, thumb_url, "❌ Model ID missing in Stripchat API response"
+
+                servers = [
+                    "edge-hls.doppiocdn.org",
+                    "edge-hls.doppiocdn.com",
+                    "edge-hls.stripchat.com",
+                    "b-hls-10.doppiocdn.org",
+                    "b-hls-30.doppiocdn.org"
+                ]
+                for s in servers:
+                    hls_url = f"https://{s}/hls/{model_id}/master/{model_id}_auto.m3u8?playlistType=standard"
+                    try:
+                        req_hls = urllib.request.Request(hls_url, headers={"User-Agent": req_headers["User-Agent"]})
+                        with urllib.request.urlopen(req_hls, timeout=4) as r_hls:
+                            logger.info(f"CustomStripchatExtractor discovered active CDN node ({s}): {hls_url}")
+                            return hls_url, username, thumb_url, None
+                    except Exception:
+                        pass
+                return None, username, thumb_url, "❌ Model is marked live, but all edge CDN nodes returned unreachable"
+            else:
+                if is_active:
+                    return None, username, thumb_url, "🔒 **Model is in a Private / Ticket Show.**\nPublic profile link cannot record private shows without session cookies or direct token `.m3u8` link."
+                else:
+                    return None, username, thumb_url, "💤 **Model is currently OFFLINE or not broadcasting.**"
+
+    except Exception as e:
+        logger.debug(f"CustomStripchatExtractor fallback error: {e}")
+
+    return None, "", None, None
+
+
 def _extract_direct_hls_from_webpage_sync(url: str, headers: Dict[str, str]) -> Tuple[Optional[str], str]:
     """
     PRO DIRECT LINK FINDER (Synchronous worker):
@@ -202,32 +289,6 @@ def _extract_direct_hls_from_webpage_sync(url: str, headers: Dict[str, str]) -> 
     return None, ""
 
 
-async def download_web_thumbnail(thumbnail_url: str, job_name: str) -> Optional[str]:
-    """
-    Download web thumbnail from yt-dlp so it can be displayed in Telegram status message header
-    and used as the video cover thumbnail.
-    """
-    if not thumbnail_url or not thumbnail_url.startswith("http"):
-        return None
-
-    thumb_path = os.path.join(RECORDINGS_DIR, f"{job_name}_web_thumb.jpg")
-    try:
-        import urllib.request
-        def _dl():
-            req = urllib.request.Request(thumbnail_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp, open(thumb_path, "wb") as f:
-                f.write(resp.read())
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _dl)
-        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 500:
-            logger.info(f"Downloaded web thumbnail to {thumb_path}")
-            return thumb_path
-    except Exception as e:
-        logger.debug(f"Web thumbnail download failed for {thumbnail_url}: {e}")
-
-    return None
-
-
 def _extract_ytdlp_sync(url: str, headers: Dict[str, str]) -> Dict[str, Any]:
     import yt_dlp
     ydl_opts = {
@@ -260,10 +321,11 @@ def classify_extraction_error(error_str: str) -> str:
 async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[str, str, Optional[str], Dict[str, str], Optional[str]]:
     """
     Resolves public web page URLs (YouTube, live streams, video pages) to a direct stream/m3u8 URL.
-    Uses multi-stage resolution:
-      1) Pro Direct Stream Finder (scans HTML/JSON for master/auto HLS links)
-      2) Python yt-dlp library
-      3) Subprocess CLI yt-dlp
+    Uses multi-stage PRO resolution:
+      1) Custom Stripchat API Extractor (Pure Python — no yt-dlp dependency!)
+      2) Pro Direct Stream Finder (scans HTML/JSON for master/auto HLS links)
+      3) Python yt-dlp library (for general sites like YouTube/Twitch)
+      4) Subprocess CLI yt-dlp
     Returns: (resolved_direct_url, title, web_thumbnail_path, combined_headers, error_message)
     """
     combined_headers = {}
@@ -276,7 +338,26 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
     if is_explicit_direct_link(normalized):
         return normalized, "", None, combined_headers, None
 
-    # 1. Pro Direct Stream Finder (scans webpage HTML/JSON for valid HLS links)
+    # 1. Custom Stripchat API Extractor (Pure Python — 100% Custom Engine!)
+    if "stripchat.com" in normalized.lower():
+        try:
+            logger.info(f"Running CustomStripchatExtractor on: {normalized}")
+            loop = asyncio.get_event_loop()
+            hls_url, uname, thumb_url, strip_err = await loop.run_in_executor(None, _extract_stripchat_custom_sync, normalized, combined_headers)
+            web_thumb_path = None
+            if thumb_url:
+                web_thumb_path = await download_web_thumbnail(thumb_url, auto_generate_job_name(normalized))
+
+            if hls_url:
+                logger.info(f"CustomStripchatExtractor resolved live stream: {hls_url[:80]}...")
+                return hls_url, uname, web_thumb_path, combined_headers, None
+            elif strip_err:
+                logger.info(f"CustomStripchatExtractor status alert: {strip_err}")
+                return normalized, uname, web_thumb_path, combined_headers, strip_err
+        except Exception as e:
+            logger.debug(f"CustomStripchatExtractor check exception: {e}")
+
+    # 2. Pro Direct Stream Finder (scans webpage HTML/JSON for valid HLS links)
     try:
         logger.info(f"Running ProStreamFinder on: {normalized}")
         loop = asyncio.get_event_loop()
@@ -287,7 +368,7 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
     except Exception as e:
         logger.debug(f"ProStreamFinder check exception: {e}")
 
-    # 2. Try Python yt_dlp library
+    # 3. Try Python yt_dlp library (only as general site fallback)
     try:
         logger.info(f"Resolving URL via Python yt-dlp library: {normalized}")
         loop = asyncio.get_event_loop()
@@ -319,7 +400,7 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
         if not is_explicit_direct_link(normalized):
             return normalized, "", None, combined_headers, classify_extraction_error(err_msg)
 
-    # 3. Fallback to CLI subprocess yt-dlp
+    # 4. Fallback to CLI subprocess yt-dlp
     try:
         cmd = [
             "yt-dlp",
@@ -369,7 +450,7 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
     except Exception as e:
         logger.debug(f"yt-dlp CLI extraction fallback error for {normalized}: {e}")
 
-    # 4. Fallback to normalized URL if direct or unresolved
+    # 5. Fallback to normalized URL if direct or unresolved
     return normalized, "", None, combined_headers, None
 
 
@@ -558,3 +639,4 @@ def cleanup_job_files(job_name: str, file_path: Optional[str] = None):
     # Force Python garbage collection to release memory on 512MB RAM server
     gc.collect()
     logger.info(f"Auto-cleanup completed for job '{job_name}' — {removed_count} files removed. Memory reclaimed.")
+
