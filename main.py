@@ -25,6 +25,7 @@ import time
 import logging
 import gc
 from datetime import datetime
+from typing import Optional, Dict, Any, List, Tuple, Set
 from dotenv import load_dotenv
 
 from pyrogram import Client, filters, idle
