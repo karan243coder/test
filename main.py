@@ -87,7 +87,8 @@ auto_restart_count: Dict[str, int] = {}   # job_name -> restarts used
 
 _BOOT_TIME = time.time()
 _last_update_time = time.time()   # watchdog ke liye
-VERSION = "V11.2-DIAG"           # health endpoint mein dikhega - deploy verify karne ke liye
+_update_counter = 0               # received updates ka counter
+VERSION = "V11.3-DIAG"           # health endpoint mein dikhega - deploy verify karne ke liye
 
 app = Client("recorder_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir=".")
 user_app = None
@@ -700,7 +701,9 @@ async def delete_old_webhook():
     for _ in range(3):
         try:
             async with aiohttp.ClientSession() as sess:
-                url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+                # NOTE: drop_pending_updates intentionally REMOVED - isse restart ke
+                # dauran aaye messages permanently delete ho jate the (no-response bug!)
                 async with sess.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     txt = await resp.text()
                     if '"ok":true' in txt.lower():
@@ -723,17 +726,27 @@ async def delete_old_webhook():
 
 @app.on_message(filters.all, group=0)
 async def debug_log_all(client, message: Message):
-    global _last_update_time
+    global _last_update_time, _update_counter
     _last_update_time = time.time()
+    _update_counter += 1
     try:
         txt = (message.text or message.caption or "")[:100]
         uid = message.from_user.id if message.from_user else "?"
         uname = message.from_user.username if message.from_user and message.from_user.username else ""
         chat = message.chat.id if message.chat else "?"
         ctype = message.chat.type if message.chat else "?"
-        logger.info(f"[INCOMING] uid={uid} @{uname} chat={chat} type={ctype} text={txt!r}")
+        logger.info(f"[INCOMING #{_update_counter}] uid={uid} @{uname} chat={chat} type={ctype} text={txt!r}")
     except Exception:
         pass
+
+
+async def alive_heartbeat():
+    """Har 5 min mein status log - batayega bot zinda hai aur updates aa rahe hain."""
+    while True:
+        await asyncio.sleep(300)
+        logger.info(f"ALIVE heartbeat: {_update_counter} updates received | "
+                    f"{len(active_jobs)} active jobs | {len(database.get_queue_jobs())} queued | "
+                    f"uptime {system_stats.format_duration_human(time.time() - _BOOT_TIME)}")
 
 
 async def update_watchdog():
@@ -1426,7 +1439,8 @@ async def main():
 
     watch_task = asyncio.create_task(watcher_loop())
     asyncio.create_task(update_watchdog())  # diagnostics: no-update alert
-    logger.info(f"Bot started - PORT {PORT} | max jobs {MAX_CONCURRENT_JOBS} | "
+    asyncio.create_task(alive_heartbeat())  # diagnostics: alive + update counter
+    logger.info(f"Bot started - {VERSION} | PORT {PORT} | max jobs {MAX_CONCURRENT_JOBS} | "
                 f"watch interval {database.get_setting('watch_interval', WATCH_INTERVAL)}s")
     await recover_interrupted_jobs()
     await idle()
