@@ -47,7 +47,6 @@ docker run -p 8080:8080 --env-file .env -v ./recordings:/app/recordings recorder
 - `/status` - active recordings
 - `/stop <name>`
 
-**Note:** `https://stripchat.com/...` jaisa public webpage link direct video nahi hai. Dost ka test karna hai toh uske broadcaster dashboard wala direct HLS lo with consent.
 
 ## FloodWait Fix
 Bot me har `edit_message` aur `send_document` pe FloodWait catch hai + 1.5 sec delay + retry. Isse Koyeb pe hang nahi hoga.
