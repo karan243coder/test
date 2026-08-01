@@ -3,19 +3,20 @@ Telegram Recorder Bot V5 (Enterprise & Pro Edition — 512MB RAM Koyeb Optimized
 Koyeb + GitHub Ready | 100% Bug-Free | Level 1 + Level 2 + Level 3 Features
 
 Features Included:
-  1. Admin / Sudo Authorization (.env OWNER_ID & SUDO_USERS + /addsudo /rmsudo /sudolist)
-  2. Public URL & Direct Stream Extraction via yt-dlp (fixes public link support)
-  3. Web Thumbnail Display in Telegram Status Header + Playable Video Cover Thumbnail
-  4. Custom HTTP Headers (Referer, User-Agent, Cookie) support via pipe syntax
-  5. Telegram Video Streaming Upload (send_video) + Auto Thumbnail (.jpg at 5s / Web thumb)
-  6. Interactive Inline Keyboard Buttons (Stop, Refresh, Cancel & Delete)
-  7. Timed / Scheduled Recording (Auto-stop timer: e.g. 90m, 30s, 2h)
-  8. Quality / Resolution Selection (/qualities & quality flag q=720p|1080p|audio)
-  9. Job Queue System with Concurrency Control (Default 1 for 512MB RAM Safety)
- 10. Auto Disk Cleanup + Python Garbage Collection (Zero OOM / Memory overflow)
- 11. Telegram Premium 4GB Upload Support via STRING_SESSION (Userbot Client)
- 12. Full Server Diagnostic Panel (/stats or /server) with CPU, Memory & Disk stats
- 13. SQLite Database Persistence & Interrupted Job Auto-Recovery on Container Restart
+  1. 100% Automatic Direct Link Recognition (Send any URL in chat -> Auto Records!)
+  2. Smart Auto Job Naming from URLs (e.g., /record https://.../model -> job 'model')
+  3. Smart Error Detection (Private Show / Ticket Show / Offline alert without 0-byte fail)
+  4. Web Thumbnail Display in Telegram Status Header + Playable Video Cover Thumbnail
+  5. Custom HTTP Headers (Referer, User-Agent, Cookie) support via pipe syntax
+  6. Telegram Video Streaming Upload (send_video) + Auto Thumbnail (.jpg at 5s / Web thumb)
+  7. Interactive Inline Keyboard Buttons (Stop, Refresh, Cancel & Delete)
+  8. Timed / Scheduled Recording (Auto-stop timer: e.g. 90m, 30s, 2h)
+  9. Quality / Resolution Selection (/qualities & quality flag q=720p|1080p|audio)
+ 10. Job Queue System with Concurrency Control (Default 1 for 512MB RAM Safety)
+ 11. Auto Disk Cleanup + Python Garbage Collection (Zero OOM / Memory overflow)
+ 12. Telegram Premium 4GB Upload Support via STRING_SESSION (Userbot Client)
+ 13. Full Server Diagnostic Panel (/stats or /server) with CPU, Memory & Disk stats
+ 14. SQLite Database Persistence & Interrupted Job Auto-Recovery on Container Restart
 """
 
 import os
@@ -36,7 +37,7 @@ from aiohttp import web
 
 import database
 import media_utils
-from media_utils import parse_record_command
+from media_utils import parse_record_command, auto_generate_job_name
 import system_stats
 
 load_dotenv()
@@ -203,9 +204,6 @@ def get_stats_buttons() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Refresh Stats", callback_data="refresh_stats")]
     ])
-
-
-# parse_record_command is imported from media_utils
 
 
 # ---------- RECORDING LOGIC & MONITORING ----------
@@ -506,8 +504,20 @@ async def check_and_start_queued_job():
 async def start_recording_job(chat_id: int, job_name: str, url: str, duration_limit: int = 0, headers: Dict[str, str] = None, quality: str = "best"):
     headers = headers or {}
 
-    # 1. Resolve public webpage URL to direct stream via yt-dlp + extract web thumbnail
-    resolved_url, title, web_thumb_path, combined_headers = await media_utils.resolve_stream_url(url, headers)
+    # 1. Resolve public webpage URL to direct stream via yt-dlp + extract web thumbnail & error analysis
+    resolved_url, title, web_thumb_path, combined_headers, err_msg = await media_utils.resolve_stream_url(url, headers)
+
+    # 2. Smart Error Check: Prevent 0-byte FFmpeg fail if model is Private Show or Offline
+    if err_msg and not media_utils.is_explicit_direct_link(url):
+        await safe_send_text(
+            chat_id,
+            f"❌ **STREAM EXTRACTION ALERT**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 **Target:** `{job_name}`\n"
+            f"{err_msg}\n\n"
+            f"💡 **Tip:** For Ticket Shows / Private Rooms, press F12 in your browser → Network Tab → copy the direct `.m3u8?token=...` link and send it here!"
+        )
+        return
 
     # Choose file extension based on quality
     ext = ".m4a" if quality == "audio" else ".mp4"
@@ -625,7 +635,9 @@ async def start_cmd(client, message: Message):
         "🔥 **TELEGRAM RECORDER BOT V5 (ENTERPRISE EDITION)**\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "🚀 **Key Features Enabled:**\n"
+        "  • 🤖 **100% Automatic Mode:** Paste any URL in chat -> Auto Records immediately!\n"
         "  • 🌐 **Public URLs & Direct HLS:** Extracted automatically via yt-dlp.\n"
+        "  • 🛡️ **Smart Private/Offline Guard:** Tells you why Private Shows fail before recording.\n"
         "  • 🖼 **Web Thumbnail Header:** Displays public thumbnail image at top of status message.\n"
         "  • 🔐 **Admin Authorized:** Sudo users & owner protected.\n"
         "  • 🎬 **Telegram Playable Video:** Custom thumbnail + duration streaming.\n"
@@ -634,9 +646,9 @@ async def start_cmd(client, message: Message):
         "  • 🚦 **512MB RAM Safety:** 1 job at a time concurrency queue + gc.collect().\n"
         "  • 🧹 **Auto Disk Cleanup:** Zero memory overflow on Koyeb/Docker.\n\n"
         "📜 **Command Reference:**\n"
-        "  • `/record <name> <url> [duration] [| Referer: ... | q=720p]`\n"
-        "      *Ex:* `/record my_show 90m https://example.com/live.m3u8`\n"
-        "      *Ex:* `/record yt_stream https://youtube.com/watch?v=...`\n"
+        "  • **Direct Link:** Simply send `https://...` in chat -> Auto starts!\n"
+        "  • `/record <url> [time] [| Referer: ... | q=720p]`\n"
+        "  • `/record <name> <url> [time]`\n"
         "  • `/qualities <url>` — Inspect available stream qualities\n"
         "  • `/status` — View active recordings with control buttons\n"
         "  • `/queue` — View pending jobs in concurrency queue\n"
@@ -661,9 +673,9 @@ async def record_cmd(client, message: Message):
         await safe_send_text(
             message.chat.id,
             "❌ **Invalid Format:**\n"
-            "Use: `/record <name> <url> [duration] [| Referer: ... | q=best|1080p|720p|audio]`\n\n"
-            "*Example 1:* `/record match 90m https://example.com/live.m3u8`\n"
-            "*Example 2:* `/record yt_show https://www.youtube.com/watch?v=... | q=720p`"
+            "Use: `/record <url> [duration] [| Referer: ... | q=best|1080p|720p|audio]`\n\n"
+            "*Example 1 (Auto Job Name):* `/record https://stripchat.com/Kaur_Simran_01`\n"
+            "*Example 2:* `/record match 90m https://example.com/live.m3u8`"
         )
         return
 
@@ -698,6 +710,68 @@ async def record_cmd(client, message: Message):
         return
 
     await start_recording_job(message.chat.id, job_name, url, duration_limit, headers, quality)
+
+
+@app.on_message(
+    filters.text
+    & ~filters.command(
+        [
+            "start",
+            "help",
+            "record",
+            "stop",
+            "status",
+            "queue",
+            "qualities",
+            "quality",
+            "stats",
+            "server",
+            "mode",
+            "addsudo",
+            "rmsudo",
+            "sudolist",
+        ]
+    )
+)
+async def auto_url_message_handler(client, message: Message):
+    """
+    100% AUTOMATIC MODE:
+    When an authorized user sends ANY URL or link in chat (without typing /record),
+    the bot automatically recognizes it, generates a smart job name, and starts recording!
+    """
+    if not check_auth(message.from_user.id):
+        return
+
+    text = message.text.strip()
+    if any(text.lower().startswith(p) for p in ["http://", "https://", "rtmp://", "srt://", "rtsp://"]):
+        logger.info(f"Auto-detected direct URL in text message: {text[:60]}")
+        # Parse text as if `/record <text>`
+        job_name, url, duration_limit, headers, quality = parse_record_command(f"/record {text}")
+        if not job_name or not url:
+            return
+
+        if job_name in active_jobs:
+            await safe_send_text(message.chat.id, f"❌ **Duplicate Job:** Recording `{job_name}` is already active.")
+            return
+
+        if len(active_jobs) >= MAX_CONCURRENT_JOBS:
+            pos = database.add_queue_job({
+                "job_name": job_name,
+                "url": url,
+                "chat_id": message.chat.id,
+                "duration_limit": duration_limit,
+                "headers": headers,
+                "quality": quality
+            })
+            if pos is not None:
+                await safe_send_text(
+                    message.chat.id,
+                    f"⏳ **Automatic URL Detected — Added to Queue (#{pos})**\n"
+                    f"📌 Job **`{job_name}`** will start when the running job completes."
+                )
+            return
+
+        await start_recording_job(message.chat.id, job_name, url, duration_limit, headers, quality)
 
 
 @app.on_message(filters.command(["qualities", "quality"]))

@@ -1,9 +1,11 @@
 """
 media_utils.py - Level 1 & Level 2 Media & Stream Handling Utilities (512MB RAM Koyeb Optimized)
 Handles:
-  - Command Parsing (/record, timed flags, quality selection, custom headers)
+  - Smart Automatic Job Name Generation from URLs
+  - Command Parsing (/record <url>, timed flags, quality selection, custom headers)
   - URL Normalization (mirror domains -> canonical domain for yt-dlp extractors)
   - Public URL / direct stream extraction via yt-dlp Python API & CLI fallback
+  - Smart Error Analysis (Private Show / Ticket Show / Offline detection without 0-byte fail)
   - Extracted Web Thumbnail URL & automatic image download for Status Display header
   - Custom Headers (User-Agent, Referer, Cookie) support
   - Stream formats/quality extraction for multi-bitrate HLS
@@ -35,7 +37,6 @@ def normalize_stream_url(url: str) -> str:
     Example: stripchatgirls.com/username -> stripchat.com/username
     """
     url_clean = url.strip()
-    # Normalize Stripchat mirrors to canonical domain
     url_clean = re.sub(
         r"https?://(?:www\.)?(?:stripchatgirls|stripchatglobal|stripchateu|stripchateurope)\.com/",
         "https://stripchat.com/",
@@ -45,11 +46,35 @@ def normalize_stream_url(url: str) -> str:
     return url_clean
 
 
+def auto_generate_job_name(url: str) -> str:
+    """
+    Automatically generate a clean, smart job name from a URL or model username.
+    Example: https://stripchat.com/Kaur_Simran_01 -> Kaur_Simran_01
+    """
+    try:
+        url_clean = url.split("?")[0].split("#")[0].rstrip("/")
+        parts = [p for p in url_clean.split("/") if p]
+        if parts:
+            candidate = parts[-1]
+            if candidate.lower() in ["m3u8", "master", "playlist", "index", "live", "stream", "chunk", "hls"]:
+                if len(parts) >= 2:
+                    candidate = f"{parts[-2]}_{candidate}"
+            # Clean non-alphanumeric chars
+            clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", candidate).strip("_")
+            if clean_name and len(clean_name) >= 2:
+                return clean_name[:30]
+    except Exception as e:
+        logger.debug(f"Auto job name error: {e}")
+
+    return f"stream_{int(time.time()) % 100000}"
+
+
 def parse_record_command(text: str) -> Tuple[Optional[str], Optional[str], int, Dict[str, str], str]:
     """
     Parses command input with optional time limits, headers, and quality flag.
-    Example:
-      /record my_show 90m https://example.com/live.m3u8 | Referer: https://site.com | q=720p
+    Supports BOTH explicit job names AND automatic URL-only commands:
+      1) /record <url> [duration] [| Referer: ... | q=720p]
+      2) /record <job_name> <url> [duration] [| Referer: ... | q=720p]
     """
     parts = text.split(" ", 1)
     if len(parts) < 2:
@@ -71,17 +96,19 @@ def parse_record_command(text: str) -> Tuple[Optional[str], Optional[str], int, 
             headers[k.strip()] = v.strip()
 
     tokens = main_section.split()
-    if len(tokens) < 2:
+    if not tokens:
         return None, None, 0, headers, quality
 
-    job_name = tokens[0]
+    job_name = ""
     url = ""
     duration_limit = 0
 
-    for tok in tokens[1:]:
+    for tok in tokens:
         tok_lower = tok.lower()
         if any(tok_lower.startswith(prefix) for prefix in ["http://", "https://", "rtmp://", "srt://", "rtsp://"]):
             url = normalize_stream_url(tok)
+            if not job_name:
+                job_name = auto_generate_job_name(url)
         elif re.match(r"^\d+[smh]?$", tok_lower):
             val = int(re.sub(r"[smh]", "", tok_lower))
             if tok_lower.endswith("m"):
@@ -93,6 +120,14 @@ def parse_record_command(text: str) -> Tuple[Optional[str], Optional[str], int, 
         else:
             if not url and "." in tok:
                 url = normalize_stream_url(tok)
+                if not job_name:
+                    job_name = auto_generate_job_name(url)
+            elif not job_name or job_name == auto_generate_job_name(url):
+                # If token is a word and url wasn't seen yet (or override auto name)
+                job_name = tok
+
+    if not job_name and url:
+        job_name = auto_generate_job_name(url)
 
     return job_name, url, duration_limit, headers, quality
 
@@ -146,11 +181,27 @@ def _extract_ytdlp_sync(url: str, headers: Dict[str, str]) -> Dict[str, Any]:
         return ydl.extract_info(url, download=False) or {}
 
 
-async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[str, str, Optional[str], Dict[str, str]]:
+def classify_extraction_error(error_str: str) -> str:
+    """
+    Convert raw yt-dlp error string to plain-language Telegram explanation.
+    """
+    err_lower = error_str.lower()
+    if any(x in err_lower for x in ["private show", "ticket show", "private room", "password", "requires authentication", "members only"]):
+        return "🔒 **Model is in a Private / Ticket Show.**\nPublic profile link cannot record private shows without session cookies or direct token `.m3u8` link."
+    if any(x in err_lower for x in ["offline", "not broadcasting", "is not live"]):
+        return "💤 **Model is currently OFFLINE or not broadcasting.**"
+    if any(x in err_lower for x in ["403", "forbidden", "unauthorized", "401"]):
+        return "🚫 **403 Forbidden / Access Denied.**\nStream server rejected access. Provide direct token `.m3u8` link or Referer/Cookie headers."
+    if any(x in err_lower for x in ["404", "not found"]):
+        return "❌ **404 Not Found:** Stream or model page does not exist."
+    return f"⚠️ **Stream Extraction Error:** `{error_str[:150]}`"
+
+
+async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[str, str, Optional[str], Dict[str, str], Optional[str]]:
     """
     Resolves public web page URLs (YouTube, live streams, video pages) to a direct stream/m3u8 URL using yt-dlp.
     If it's already an explicit direct media URL, returns it as is.
-    Returns: (resolved_direct_url, title, web_thumbnail_path, combined_headers)
+    Returns: (resolved_direct_url, title, web_thumbnail_path, combined_headers, error_message)
     """
     combined_headers = {}
     if headers:
@@ -158,7 +209,7 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
 
     normalized = normalize_stream_url(url)
 
-    # 1. Try Python yt_dlp library first (if installed in Docker/environment)
+    # 1. Try Python yt_dlp library first
     try:
         logger.info(f"Resolving URL via Python yt-dlp library: {normalized}")
         loop = asyncio.get_event_loop()
@@ -175,17 +226,20 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
 
         web_thumb_path = None
         if thumbnail_url:
-            clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", title[:15]) or "thumb"
+            clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", title[:15]) or auto_generate_job_name(normalized)
             web_thumb_path = await download_web_thumbnail(thumbnail_url, clean_name)
 
         if extracted_url:
             logger.info(f"Successfully resolved stream URL via Python yt-dlp: {title}")
-            return extracted_url, title, web_thumb_path, combined_headers
+            return extracted_url, title, web_thumb_path, combined_headers, None
 
     except ImportError:
         logger.debug("Python yt_dlp module not installed; falling back to CLI subprocess...")
     except Exception as e:
-        logger.warning(f"Python yt_dlp extraction failed for {normalized}: {e}")
+        err_msg = str(e)
+        logger.warning(f"Python yt_dlp extraction failed for {normalized}: {err_msg}")
+        if not is_explicit_direct_link(normalized):
+            return normalized, "", None, combined_headers, classify_extraction_error(err_msg)
 
     # 2. Fallback to CLI subprocess yt-dlp
     try:
@@ -223,18 +277,22 @@ async def resolve_stream_url(url: str, headers: Optional[Dict[str, str]] = None)
 
             web_thumb_path = None
             if thumbnail_url:
-                clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", title[:15]) or "thumb"
+                clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", title[:15]) or auto_generate_job_name(normalized)
                 web_thumb_path = await download_web_thumbnail(thumbnail_url, clean_name)
 
             if extracted_url:
                 logger.info(f"Successfully resolved stream URL via yt-dlp CLI: {title}")
-                return extracted_url, title, web_thumb_path, combined_headers
+                return extracted_url, title, web_thumb_path, combined_headers, None
+        else:
+            err_output = stderr.decode("utf-8", errors="ignore")
+            if not is_explicit_direct_link(normalized) and err_output:
+                return normalized, "", None, combined_headers, classify_extraction_error(err_output)
 
     except Exception as e:
         logger.debug(f"yt-dlp CLI extraction fallback error for {normalized}: {e}")
 
     # 3. Fallback to normalized URL if direct or unresolved
-    return normalized, "", None, combined_headers
+    return normalized, "", None, combined_headers, None
 
 
 async def get_stream_qualities(url: str, headers: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
