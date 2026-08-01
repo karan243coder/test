@@ -2,3 +2,6 @@ pyrogram==2.0.106
 tgcrypto==1.2.5
 python-dotenv==1.0.0
 aiohttp==3.9.5
+psutil>=5.9.0
+Pillow>=10.0.0
+yt-dlp>=2024.7.0

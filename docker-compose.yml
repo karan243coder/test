@@ -2,7 +2,7 @@ version: '3.8'
 services:
   recorder-bot:
     build: .
-    container_name: recorder_v4
+    container_name: recorder_v5
     restart: unless-stopped
     ports:
       - "8080:8080"

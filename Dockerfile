@@ -1,6 +1,9 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -16,4 +19,4 @@ EXPOSE 8080
 # Koyeb expects PORT 8080
 ENV PORT=8080
 
-CMD ["python", "main.py"]
+CMD ["python", "-u", "main.py"]
