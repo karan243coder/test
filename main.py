@@ -187,11 +187,11 @@ async def delete_webhook_via_pyrogram():
 async def health_handler(request):
     active = len(active_jobs)
     queued = len(database.get_queue_jobs())
-    return web.Response(text=f"Bot Alive - {active} active | {queued} queued (V8 Fixed)", status=200)
+    return web.Response(text=f"Bot Alive - {active} active | {queued} queued (V10 FINAL)", status=200)
 
 
 async def root_handler(request):
-    return web.Response(text="Telegram Recorder Bot V8 FINAL FIXED is Running", status=200)
+    return web.Response(text="Telegram Recorder Bot V10 FINAL FIXED is Running - Mouflon Proxy Active", status=200)
 
 
 async def catch_all_handler(request):
@@ -202,10 +202,122 @@ async def catch_all_handler(request):
     return web.Response(text="OK - polling mode", status=200)
 
 
+async def mouflon_proxy_handler(request):
+    """
+    Proxy that fetches Stripchat HLS variant with psch/pkey and decodes it using pdkey if available
+    Query params: url, pkey, psch, model (optional username for Referer)
+    """
+    url = request.query.get('url')
+    pkey = request.query.get('pkey', '')
+    psch = request.query.get('psch', 'v2')
+    username = request.query.get('username', 'unknown')
+
+    if not url:
+        return web.Response(status=400, text="Missing url param")
+
+    # Load keys
+    keys = media_utils.load_mouflon_keys()
+    pdkey = keys.get(pkey) if pkey else None
+
+    # If no pdkey for this pkey, try any key as fallback (some players do this)
+    if not pdkey and keys:
+        # Try to find any key, prefer zokee
+        for k in keys.keys():
+            if k.lower().startswith('zokee'):
+                pdkey = keys[k]
+                pkey = k
+                break
+        if not pdkey:
+            # Take first available
+            first_key = next(iter(keys.keys()))
+            pdkey = keys[first_key]
+            # Note: pkey mismatch may cause garbled decode, but try
+
+    try:
+        import urllib.request
+        # Fetch remote m3u8 with proper headers
+        req_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": f"https://stripchat.com/{username}",
+            "Origin": "https://stripchat.com",
+            "Accept": "*/*",
+        }
+        req = urllib.request.Request(url, headers=req_headers)
+        loop = asyncio.get_event_loop()
+        def _fetch():
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.read().decode("utf-8", errors="ignore")
+        content = await loop.run_in_executor(None, _fetch)
+
+        # If content is AD, return as is (should not happen, we already filtered AD)
+        if media_utils._is_ad_playlist(content):
+            logger.warning(f"Mouflon proxy fetched AD playlist for {username} pkey={pkey}, returning as is (will fail)")
+            return web.Response(text=content, content_type="application/vnd.apple.mpegurl")
+
+        # If we have pdkey, try to decode
+        if pdkey:
+            try:
+                decoded = media_utils._decode_m3u8_content(content, pkey, pdkey)
+                # Also need to ensure segment URLs have psch/pkey query still? The decoded should already have actual segment URLs
+                # For safety, append psch/pkey to all http URLs in decoded content if not present
+                # This is what StreaMonitor does via _append_params
+                # We'll append if doppiocdn host
+                def _append_psch_pkey(m3u8_text, psch, pkey):
+                    import re
+                    def _append(url):
+                        if "doppiocdn" in url and "psch=" not in url and "pkey=" not in url:
+                            sep = "&" if "?" in url else "?"
+                            return f"{url}{sep}psch={psch}&pkey={pkey}"
+                        return url
+                    # Replace all https URLs
+                    def repl(match):
+                        orig_url = match.group(0)
+                        return _append(orig_url)
+                    # Find all https://...m3u8 or .mp4 or .ts or .m4s URLs
+                    pattern = r"https://[^\s\"']+\.(?:m3u8|mp4|ts|m4s|mpd)[^\s\"']*"
+                    # Actually we want to keep already decoded URLs, just ensure psch/pkey present
+                    # For simplicity, append to all doppiocdn URLs that don't have psch
+                    lines = []
+                    for line in m3u8_text.splitlines():
+                        if line.startswith("https://") and "doppiocdn" in line:
+                            if "psch=" not in line:
+                                sep = "&" if "?" in line else "?"
+                                line = f"{line}{sep}psch={psch}&pkey={pkey}"
+                        lines.append(line)
+                    return "\n".join(lines) + "\n"
+
+                # If decoded still contains media.mp4 placeholder, decoding failed (wrong pdkey)
+                if "media.mp4" in decoded:
+                    logger.warning(f"Mouflon decode for {username} pkey={pkey} still has media.mp4 placeholder, pdkey may be wrong")
+                    # Return original content with warning header?
+                    # Try to return decoded anyway, but log
+                else:
+                    logger.info(f"Mouflon proxy decoded LIVE playlist for {username} pkey={pkey} -> {len(decoded)} chars, segments: {decoded.count('.mp4')}")
+
+                # Append psch/pkey to all segment URLs to ensure they work
+                decoded_with_params = _append_psch_pkey(decoded, psch, pkey) if 'pdkey' in locals() else decoded
+
+                return web.Response(text=decoded_with_params, content_type="application/vnd.apple.mpegurl", headers={"Access-Control-Allow-Origin": "*"})
+
+            except Exception as e:
+                logger.error(f"Mouflon decode failed for {username} pkey={pkey}: {e}")
+                # Fallback to original content
+                return web.Response(text=content, content_type="application/vnd.apple.mpegurl")
+        else:
+            logger.warning(f"No pdkey found for pkey {pkey}, returning raw live playlist (ffmpeg will likely fail with 404 for media.mp4)")
+            return web.Response(text=content, content_type="application/vnd.apple.mpegurl")
+
+    except Exception as e:
+        logger.error(f"Mouflon proxy error for {url}: {e}")
+        return web.Response(status=502, text=f"Proxy fetch failed: {e}")
+
+
 async def start_web_server():
     web_app = web.Application()
     web_app.router.add_get("/", root_handler)
     web_app.router.add_get("/health", health_handler)
+    web_app.router.add_get("/mouflon_proxy", mouflon_proxy_handler)
+    web_app.router.add_get("/hls_proxy", mouflon_proxy_handler)  # alias
     web_app.router.add_post("/tg/{tail:.*}", catch_all_handler)
     web_app.router.add_get("/tg/{tail:.*}", health_handler)
     web_app.router.add_post("/{tail:.*}", catch_all_handler)
@@ -214,7 +326,7 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"Koyeb Health check server started on 0.0.0.0:{PORT} (access_log disabled)")
+    logger.info(f"Koyeb Health check server started on 0.0.0.0:{PORT} with mouflon_proxy (access_log disabled)")
     while True:
         await asyncio.sleep(3600)
 
@@ -488,7 +600,21 @@ async def run_ffmpeg_and_auto_send(job_name: str):
 
     # Check file
     if not os.path.exists(file_path):
-        await safe_send_text(job["chat_id"], f"❌ **Recording Failed:** `{job_name}` file not found")
+        ffmpeg_err = ""
+        if ffmpeg_log_path and os.path.exists(ffmpeg_log_path):
+            try:
+                with open(ffmpeg_log_path, "r", errors="ignore") as lf:
+                    content = lf.read()
+                    ffmpeg_err = content[-2000:]
+                    logger.error(f"FFmpeg log for {job_name} (file not found): {content[:4000]}")
+            except:
+                pass
+        # Detect mouflon case
+        mouflon_hint = ""
+        if ffmpeg_err and ("media.mp4" in ffmpeg_err and ("404" in ffmpeg_err or "No such file" in ffmpeg_err or "Server returned 404" in ffmpeg_err)):
+            mouflon_hint = "\n\n🔑 **Mouflon Decrypt Needed:** Playlist contains `media.mp4` placeholder with encrypted segments. This happens when `pdkey` is missing or wrong for pkey. Provide correct `pkey:pdkey` in `stripchat_mouflon_keys.json` or `MOUFLON_KEYS` env var. Without correct pdkey, segments return 404 and file is 0B. Check logs: Found LIVE HLS with pkey but no pdkey?"
+        err_details = f"\n\n🪵 **FFmpeg Log:**\n```\n{ffmpeg_err[:1000]}\n```" if ffmpeg_err else ""
+        await safe_send_text(job["chat_id"], f"❌ **Recording Failed:** `{job_name}` file not found (ffmpeg didn't create file, likely 404 on segments). Return Code: `{returncode}`{mouflon_hint}{err_details}")
         active_jobs.pop(job_name, None)
         database.remove_job(job_name)
         media_utils.cleanup_job_files(job_name, file_path)
@@ -504,12 +630,15 @@ async def run_ffmpeg_and_auto_send(job_name: str):
             try:
                 with open(ffmpeg_log_path, "r", errors="ignore") as lf:
                     content = lf.read()
-                    ffmpeg_err = content[-1500:]
-                    logger.error(f"FFmpeg log for {job_name}: {content[:3000]}")
+                    ffmpeg_err = content[-2000:]
+                    logger.error(f"FFmpeg log for {job_name}: {content[:4000]}")
             except:
                 pass
-        err_details = f"\n\n🪵 **FFmpeg Log:**\n```\n{ffmpeg_err[:800]}\n```" if ffmpeg_err else ""
-        await safe_send_text(job["chat_id"], f"❌ **Recording Failed:** `{job_name}` produced 0 bytes.\nReturn Code: `{returncode}`{err_details}")
+        mouflon_hint = ""
+        if ffmpeg_err and ("media.mp4" in ffmpeg_err or "MOUFLON" in ffmpeg_err):
+            mouflon_hint = "\n\n🔑 **Mouflon Issue:** Detected `media.mp4` or MOUFLON in ffmpeg log. This means playlist not decoded, need correct pdkey. Provide keys via file/env."
+        err_details = f"\n\n🪵 **FFmpeg Log:**\n```\n{ffmpeg_err[:1000]}\n```" if ffmpeg_err else ""
+        await safe_send_text(job["chat_id"], f"❌ **Recording Failed:** `{job_name}` produced 0 bytes (size {size}). Return Code: `{returncode}`{mouflon_hint}{err_details}")
         active_jobs.pop(job_name, None)
         database.remove_job(job_name)
         media_utils.cleanup_job_files(job_name, file_path)

@@ -606,11 +606,41 @@ def _try_find_working_hls(model_id: str, username: str, hosts: List[str], header
                             # Check if live
                             if _is_live_playlist(var_content):
                                 logger.info(f"Found LIVE HLS for {username} on {host}: {try_url} (AD check passed)")
-                                # If we have mouflon keys, we could try to decode and test if segments would work
-                                # For now, return the URL with psch/pkey - ffmpeg will need proxy to decode segments if keys available
-                                # If keys available, we will use local proxy later
-                                # Return this URL
-                                return try_url
+                                # If we have mouflon keys for this pkey, return via local proxy that will decode
+                                mouflon_keys = load_mouflon_keys()
+                                # Extract pkey from try_url
+                                m = re.search(r'pkey=([^&]+)', try_url)
+                                cur_pkey = m.group(1) if m else (pkey if 'pkey' in locals() else "")
+                                cur_psch = psch if 'psch' in locals() else "v2"
+                                # Check if we have pdkey for this pkey
+                                if cur_pkey and cur_pkey in mouflon_keys:
+                                    import os, urllib.parse
+                                    port = os.getenv("PORT", "8080")
+                                    # URL-encode the variant url for safe query param passing
+                                    encoded_url = urllib.parse.quote(try_url, safe='')
+                                    proxy_url = f"http://127.0.0.1:{port}/mouflon_proxy?url={encoded_url}&pkey={cur_pkey}&psch={cur_psch}&username={username}"
+                                    logger.info(f"Returning proxy URL for {username} with pdkey available: {proxy_url[:200]}...")
+                                    return proxy_url
+                                else:
+                                    # No pdkey for this pkey, try to find any available key as fallback (some players do this)
+                                    # Check if we have any keys at all, if yes, use first one as fallback to try decoding
+                                    if mouflon_keys:
+                                        # Pick a key that starts with zokee or first available
+                                        fallback_pkey = None
+                                        for k in mouflon_keys.keys():
+                                            if k.lower().startswith('zokee'):
+                                                fallback_pkey = k
+                                                break
+                                        if not fallback_pkey:
+                                            fallback_pkey = next(iter(mouflon_keys.keys()))
+                                        import os, urllib.parse
+                                        port = os.getenv("PORT", "8080")
+                                        encoded_url = urllib.parse.quote(try_url, safe='')
+                                        proxy_url = f"http://127.0.0.1:{port}/mouflon_proxy?url={encoded_url}&pkey={fallback_pkey}&psch={cur_psch}&username={username}"
+                                        logger.warning(f"Found LIVE HLS for {username} but no pdkey for pkey {cur_pkey}, using fallback pkey {fallback_pkey} proxy: {proxy_url[:200]}")
+                                        return proxy_url
+                                    logger.warning(f"Found LIVE HLS for {username} but no pdkey for pkey {cur_pkey} (have {len(mouflon_keys)} keys, need {cur_pkey}). Returning direct URL which will likely fail with 404 for media.mp4. Provide keys via stripchat_mouflon_keys.json")
+                                    return try_url
                             else:
                                 logger.debug(f"Variant {try_url} not live, len {len(var_content)}")
                         except Exception as e:
