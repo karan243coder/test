@@ -6,6 +6,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, 
 from .config import Settings
 from .urls import extract_supported_url, platform_name
 from .recorder import RecordingManager
+from .health import start_health_server
 from .resolver import resolve_public_stream, PublicStreamUnavailable
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -127,4 +128,6 @@ async def controls(_: Client, query: CallbackQuery):
         return await query.message.edit_text("⏹ <b>Stop requested</b>\n\nFinalizing the saved recording. It will upload automatically when ready.", parse_mode="html", reply_markup=keyboard(token, active=True))
 
 if __name__ == "__main__":
+    # Koyeb requires a listener on $PORT; start it before Pyrogram connects.
+    start_health_server()
     app.run()
