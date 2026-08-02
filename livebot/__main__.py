@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio, logging, secrets, time
 from dataclasses import dataclass
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
 from .config import Settings
 from .urls import extract_supported_url, platform_name
@@ -68,7 +68,7 @@ async def link_handler(_: Client, message: Message):
     token = secrets.token_urlsafe(7).replace("-", "a").replace("_", "b")[:10]
     item = Preview(owner_id=message.from_user.id, url=url, platform=platform_name(url), created=time.monotonic())
     previews[token] = item
-    await message.reply_text(preview_text(item), parse_mode="html", reply_markup=keyboard(token), disable_web_page_preview=True)
+    await message.reply_text(preview_text(item), parse_mode=enums.ParseMode.HTML, reply_markup=keyboard(token), disable_web_page_preview=True)
 
 
 @app.on_callback_query(filters.regex(r"^lr:(start|refresh|status|stop|close):"))
@@ -92,14 +92,14 @@ async def controls(_: Client, query: CallbackQuery):
     if action == "refresh":
         await query.answer("Checking public playback…")
         item.availability = "Checking…"
-        await query.message.edit_text(preview_text(item), parse_mode="html", reply_markup=keyboard(token), disable_web_page_preview=True)
+        await query.message.edit_text(preview_text(item), parse_mode=enums.ParseMode.HTML, reply_markup=keyboard(token), disable_web_page_preview=True)
         try:
             _, title = await resolve_public_stream(item.url)
             item.title = title
             item.availability = "✅ Public playback resolved"
         except PublicStreamUnavailable:
             item.availability = "⚠️ Public playback unavailable right now"
-        await query.message.edit_text(preview_text(item), parse_mode="html", reply_markup=keyboard(token), disable_web_page_preview=True)
+        await query.message.edit_text(preview_text(item), parse_mode=enums.ParseMode.HTML, reply_markup=keyboard(token), disable_web_page_preview=True)
         return
 
     if action == "start":
@@ -114,18 +114,18 @@ async def controls(_: Client, query: CallbackQuery):
         except RuntimeError as exc:
             return await query.answer(str(exc), show_alert=True)
         item.availability = f"🔴 Recording requested — {minutes} min limit"
-        await query.message.edit_text(preview_text(item), parse_mode="html", reply_markup=keyboard(token, active=True), disable_web_page_preview=True)
+        await query.message.edit_text(preview_text(item), parse_mode=enums.ParseMode.HTML, reply_markup=keyboard(token, active=True), disable_web_page_preview=True)
         return
 
     job = await manager.status(item.owner_id)
     if action == "status":
         if not job: return await query.answer("No active recording.", show_alert=True)
         await query.answer("Status updated")
-        return await query.message.edit_text(job.progress.render() if job.progress else "🔎 Resolving public stream…", parse_mode="html", reply_markup=keyboard(token, active=True))
+        return await query.message.edit_text(job.progress.render() if job.progress else "🔎 Resolving public stream…", parse_mode=enums.ParseMode.HTML, reply_markup=keyboard(token, active=True))
     if action == "stop":
         if not await manager.stop(item.owner_id): return await query.answer("No active recording.", show_alert=True)
         await query.answer("Stopping safely; final upload will follow.")
-        return await query.message.edit_text("⏹ <b>Stop requested</b>\n\nFinalizing the saved recording. It will upload automatically when ready.", parse_mode="html", reply_markup=keyboard(token, active=True))
+        return await query.message.edit_text("⏹ <b>Stop requested</b>\n\nFinalizing the saved recording. It will upload automatically when ready.", parse_mode=enums.ParseMode.HTML, reply_markup=keyboard(token, active=True))
 
 if __name__ == "__main__":
     # Koyeb requires a listener on $PORT; start it before Pyrogram connects.

@@ -3,7 +3,7 @@ import asyncio, os, re, shutil, signal, time, uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from pyrogram import Client
+from pyrogram import Client, enums
 from pyrogram.types import Message
 from .progress import LiveProgress
 from .resolver import resolve_public_stream, PublicStreamUnavailable
@@ -53,7 +53,7 @@ class RecordingManager:
         return shutil.disk_usage(self.settings.recordings_dir).free >= self.settings.max_disk_gb * 1024**3
 
     async def _edit(self, job: RecordingJob, force=False):
-        try: await job.progress_message.edit_text(job.progress.render(), parse_mode="html", disable_web_page_preview=True)
+        try: await job.progress_message.edit_text(job.progress.render(), parse_mode=enums.ParseMode.HTML, disable_web_page_preview=True)
         except Exception: pass
 
     async def _run(self, app: Client, job: RecordingJob):
@@ -87,14 +87,14 @@ class RecordingManager:
                 await remux.communicate()
                 if remux.returncode != 0 or not final.exists(): final = output
                 job.progress.status = "Uploading to Telegram"; job.progress.bytes_written = final.stat().st_size; await self._edit(job)
-                await app.send_document(job.progress_message.chat.id, str(final), caption=f"✅ <b>Live recording complete</b>\n🎥 {job.platform}\n📺 <code>{job.title}</code>", parse_mode="html")
+                await app.send_document(job.progress_message.chat.id, str(final), caption=f"✅ <b>Live recording complete</b>\n🎥 {job.platform}\n📺 <code>{job.title}</code>", parse_mode=enums.ParseMode.HTML)
                 job.progress.status = "Completed"; await self._edit(job)
         except PublicStreamUnavailable as exc:
             job.progress = job.progress or LiveProgress(job.platform, "live", job.started_at); job.progress.status = "Public stream unavailable"; await self._edit(job)
-            await app.send_message(job.progress_message.chat.id, f"❌ Public live stream could not be resolved.\n<code>{str(exc)}</code>\n\nThis bot does not bypass logins, private/paid rooms, or bot protection.", parse_mode="html")
+            await app.send_message(job.progress_message.chat.id, f"❌ Public live stream could not be resolved.\n<code>{str(exc)}</code>\n\nThis bot does not bypass logins, private/paid rooms, or bot protection.", parse_mode=enums.ParseMode.HTML)
         except Exception as exc:
             job.progress = job.progress or LiveProgress(job.platform, "live", job.started_at); job.progress.status = "Failed"; await self._edit(job)
-            await app.send_message(job.progress_message.chat.id, f"❌ Recording failed: <code>{str(exc)[:500]}</code>", parse_mode="html")
+            await app.send_message(job.progress_message.chat.id, f"❌ Recording failed: <code>{str(exc)[:500]}</code>", parse_mode=enums.ParseMode.HTML)
         finally:
             self.jobs.pop(job.user_id, None)
             # Successful upload is durable in Telegram; remove local temporary recording.
